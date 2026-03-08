@@ -65,7 +65,7 @@ def scrape_all_course():
     art_sci_main_url_content = BeautifulSoup(results.content, "html.parser")
 
     # Step 2: Find the embedded links for the course offerings page for each department within the faculty
-    art_sci_main_url_content_container = art_sci_main_url_content.find("div", class_="sitemap") # get the container element
+    art_sci_main_url_content_container = art_sci_main_url_content.find("ul", {"id": "/arts-science/course-descriptions/"}) # get the container element
     art_sci_dept_course_pages = art_sci_main_url_content_container.find_all("a") # get all the links in the container
 
     # Step 3: For each department, go through the courses offered and scrape the data

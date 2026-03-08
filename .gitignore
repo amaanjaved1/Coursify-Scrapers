@@ -2,3 +2,4 @@
 apps/scrapers/venv
 .env
 apps/redis/redis-test.py
+.claude/
