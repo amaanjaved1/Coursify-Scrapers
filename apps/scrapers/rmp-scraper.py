@@ -8,6 +8,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoSuchElementException
 from selenium.common.exceptions import TimeoutException
 from selenium.common.exceptions import ElementClickInterceptedException
+from selenium.common.exceptions import WebDriverException
 import time
 from textblob import TextBlob
 from supabase import create_client, Client
@@ -178,6 +179,9 @@ def scrape_professors(supabase, testing=True):
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--log-level=3")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--js-flags=--max-old-space-size=512")
     driver = webdriver.Chrome(options=options)
 
     professors = []
@@ -202,6 +206,7 @@ def scrape_professors(supabase, testing=True):
 
         while True:
             time.sleep(1)  # tiny wait to avoid rapid clicking
+            tab_crashed = False
 
             # Get professor cards
             professor_cards = driver.find_elements(By.CLASS_NAME, "TeacherCard__StyledTeacherCard-syjs0d-0")
@@ -239,7 +244,14 @@ def scrape_professors(supabase, testing=True):
                     print(name, "extracted")
         
                 except Exception as e:
+                    if isinstance(e, WebDriverException) and "tab crashed" in str(e):
+                        tab_crashed = True
+                        break
                     print(f"Error extracting professor data: {e}")
+
+            if tab_crashed:
+                print(f"Stopping pagination (tab crashed). Returning {len(professors)} professors.")
+                break
 
             previous_count = len(professor_cards)
 
@@ -260,6 +272,9 @@ def scrape_professors(supabase, testing=True):
                     break
 
             except NoSuchElementException:
+                break
+            except WebDriverException:
+                print(f"Stopping pagination (tab crashed or unreachable). Returning {len(professors)} professors.")
                 break
 
             # Testing mode: Limit pages
@@ -328,6 +343,9 @@ def scrape_professor_comments(supabase, prof, valid_courses):
     options.add_argument("--disable-extensions")
     options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--log-level=3")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--disable-features=VizDisplayCompositor")
+    options.add_argument("--js-flags=--max-old-space-size=512")
 
     driver = webdriver.Chrome(options=options)
     driver.set_page_load_timeout(20)
