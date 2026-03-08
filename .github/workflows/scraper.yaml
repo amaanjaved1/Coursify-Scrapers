@@ -78,9 +78,9 @@ jobs:
           pip install -r apps/scrapers/requirements.txt
 
       - name: Set up Chrome for RMP scraper
-        uses: webfactory/chrome-setup@v1
+        uses: browser-actions/setup-chrome@v1
         with:
-          chrome-version: stable
+          chrome-version: "latest"
 
       - name: Run RMP scraper
         env:
