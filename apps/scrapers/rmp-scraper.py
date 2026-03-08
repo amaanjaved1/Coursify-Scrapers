@@ -208,79 +208,83 @@ def scrape_professors(supabase, testing=True):
             time.sleep(1)  # tiny wait to avoid rapid clicking
             tab_crashed = False
 
-            # Get professor cards
-            professor_cards = driver.find_elements(By.CLASS_NAME, "TeacherCard__StyledTeacherCard-syjs0d-0")
-            for card in professor_cards[previous_count:]:
-                try:
-                    name = card.find_element(By.CLASS_NAME, "CardName__StyledCardName-sc-1gyrgim-0").text
-                    department = card.find_element(By.CLASS_NAME, "CardSchool__Department-sc-19lmz2k-0").text
-                    school = card.find_element(By.CLASS_NAME, "CardSchool__School-sc-19lmz2k-1").text
-                    rating = card.find_element(By.CLASS_NAME, "CardNumRating__CardNumRatingNumber-sc-17t4b9u-2").text
-                    num_ratings = card.find_element(By.CLASS_NAME, "CardNumRating__CardNumRatingCount-sc-17t4b9u-3").text # formatted as "X ratings"
-                    num_ratings = int(num_ratings.split()[0].replace(",", ""))  # Convert to integer
-
-                    # Extract href directly from card; skip if missing
-                    prof_url = card.get_attribute("href")
-                    if not prof_url:
-                        continue
-
-                    # Make URL absolute if needed
-                    if prof_url.startswith("/"):
-                        prof_url = f"https://www.ratemyprofessors.com{prof_url}"
-
-                    prof_id = prof_url.rstrip('/').split('/')[-1]
-
-                    if prof_id not in seen_professor_ids:
-                        seen_professor_ids.add(prof_id)
-
-                        professors.append({
-                            "id": prof_id,
-                            "name": name,
-                            "department": department,
-                            "school": school,
-                            "overall_rating": rating,
-                            "num_ratings": num_ratings,
-                            "url": prof_url,
-                        })
-
-                    print(name, "extracted")
-        
-                except Exception as e:
-                    if isinstance(e, WebDriverException) and "tab crashed" in str(e):
-                        tab_crashed = True
-                        break
-                    print(f"Error extracting professor data: {e}")
-
-            if tab_crashed:
-                print(f"Stopping pagination (tab crashed). Returning {len(professors)} professors.")
-                break
-
-            previous_count = len(professor_cards)
-
-            # Check for "Show More" button
             try:
-                show_more_button = driver.find_element(By.XPATH, "//button[contains(text(), 'Show More')]")
-
-                # Safety: check if it's visible and enabled
-                if show_more_button.is_displayed() and show_more_button.is_enabled():
+                # Get professor cards
+                professor_cards = driver.find_elements(By.CLASS_NAME, "TeacherCard__StyledTeacherCard-syjs0d-0")
+                for card in professor_cards[previous_count:]:
                     try:
-                        show_more_button.click()
-                    except ElementClickInterceptedException:
-                        try:
-                            driver.execute_script("arguments[0].click();", show_more_button)
-                        except Exception:
+                        name = card.find_element(By.CLASS_NAME, "CardName__StyledCardName-sc-1gyrgim-0").text
+                        department = card.find_element(By.CLASS_NAME, "CardSchool__Department-sc-19lmz2k-0").text
+                        school = card.find_element(By.CLASS_NAME, "CardSchool__School-sc-19lmz2k-1").text
+                        rating = card.find_element(By.CLASS_NAME, "CardNumRating__CardNumRatingNumber-sc-17t4b9u-2").text
+                        num_ratings = card.find_element(By.CLASS_NAME, "CardNumRating__CardNumRatingCount-sc-17t4b9u-3").text # formatted as "X ratings"
+                        num_ratings = int(num_ratings.split()[0].replace(",", ""))  # Convert to integer
+
+                        # Extract href directly from card; skip if missing
+                        prof_url = card.get_attribute("href")
+                        if not prof_url:
+                            continue
+
+                        # Make URL absolute if needed
+                        if prof_url.startswith("/"):
+                            prof_url = f"https://www.ratemyprofessors.com{prof_url}"
+
+                        prof_id = prof_url.rstrip('/').split('/')[-1]
+
+                        if prof_id not in seen_professor_ids:
+                            seen_professor_ids.add(prof_id)
+
+                            professors.append({
+                                "id": prof_id,
+                                "name": name,
+                                "department": department,
+                                "school": school,
+                                "overall_rating": rating,
+                                "num_ratings": num_ratings,
+                                "url": prof_url,
+                            })
+
+                        print(name, "extracted")
+
+                    except Exception as e:
+                        if isinstance(e, WebDriverException) and "tab crashed" in str(e):
+                            tab_crashed = True
                             break
-                else:
+                        print(f"Error extracting professor data: {e}")
+
+                if tab_crashed:
+                    print(f"Stopping pagination (tab crashed). Returning {len(professors)} professors.")
                     break
 
-            except NoSuchElementException:
-                break
+                previous_count = len(professor_cards)
+
+                # Check for "Show More" button
+                try:
+                    show_more_button = driver.find_element(By.XPATH, "//button[contains(text(), 'Show More')]")
+
+                    # Safety: check if it's visible and enabled
+                    if show_more_button.is_displayed() and show_more_button.is_enabled():
+                        try:
+                            show_more_button.click()
+                        except ElementClickInterceptedException:
+                            try:
+                                driver.execute_script("arguments[0].click();", show_more_button)
+                            except Exception:
+                                break
+                    else:
+                        break
+
+                except NoSuchElementException:
+                    break
+                except WebDriverException:
+                    print(f"Stopping pagination (tab crashed or unreachable). Returning {len(professors)} professors.")
+                    break
+
+                # Testing mode: Limit pages
+                if testing and len(professors) > 20:
+                    break
             except WebDriverException:
                 print(f"Stopping pagination (tab crashed or unreachable). Returning {len(professors)} professors.")
-                break
-
-            # Testing mode: Limit pages
-            if testing and len(professors) > 20:
                 break
 
     finally:
