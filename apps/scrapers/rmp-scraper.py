@@ -7,6 +7,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import NoSuchElementException
 from selenium.common.exceptions import TimeoutException
+from selenium.common.exceptions import ElementClickInterceptedException
 import time
 from textblob import TextBlob
 from supabase import create_client, Client
@@ -189,6 +190,16 @@ def scrape_professors(supabase, testing=True):
             EC.presence_of_element_located((By.CLASS_NAME, "TeacherCard__StyledTeacherCard-syjs0d-0"))
         )
 
+        # Dismiss OneTrust cookie banner so it does not intercept "Show More" clicks
+        try:
+            accept_btn = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.ID, "onetrust-accept-btn-handler"))
+            )
+            accept_btn.click()
+            time.sleep(1)
+        except (TimeoutException, NoSuchElementException, Exception):
+            pass
+
         while True:
             time.sleep(1)  # tiny wait to avoid rapid clicking
 
@@ -235,17 +246,20 @@ def scrape_professors(supabase, testing=True):
             # Check for "Show More" button
             try:
                 show_more_button = driver.find_element(By.XPATH, "//button[contains(text(), 'Show More')]")
-                
+
                 # Safety: check if it's visible and enabled
                 if show_more_button.is_displayed() and show_more_button.is_enabled():
-                    show_more_button.click()
-                    # print("Clicked 'Show More'")
+                    try:
+                        show_more_button.click()
+                    except ElementClickInterceptedException:
+                        try:
+                            driver.execute_script("arguments[0].click();", show_more_button)
+                        except Exception:
+                            break
                 else:
-                    # print("'Show More' button not clickable anymore.")
                     break
 
             except NoSuchElementException:
-                # print("No 'Show More' button found at all.")
                 break
 
             # Testing mode: Limit pages
@@ -329,7 +343,17 @@ def scrape_professor_comments(supabase, prof, valid_courses):
         except TimeoutException:
             print(f"Timeout while loading {prof['url']}. Skipping...")
             return
-        
+
+        # Dismiss OneTrust cookie banner if present so it does not block clicks
+        try:
+            accept_btn = WebDriverWait(driver, 5).until(
+                EC.element_to_be_clickable((By.ID, "onetrust-accept-btn-handler"))
+            )
+            accept_btn.click()
+            time.sleep(1)
+        except (TimeoutException, NoSuchElementException, Exception):
+            pass
+
         WebDriverWait(driver, 5).until(
             EC.presence_of_element_located((By.CLASS_NAME, "RatingValue__Numerator-qw8sqy-2"))
         )
