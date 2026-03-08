@@ -4,6 +4,7 @@ import re
 import uuid
 from datetime import datetime
 from supabase import create_client, Client
+from postgrest.exceptions import APIError
 from textblob import TextBlob
 
 # Precompiled regex patterns
@@ -213,16 +214,7 @@ def scrape_and_store(courses, professors):
     subreddit = reddit.subreddit("queensuniversity")
     results = []
 
-    # Fetch already processed posts from Supabase by using post url (source_url)
-    processed_posts = supabase.table("rag_chunks").select("source_url").eq("source", "reddit").execute()
-    processed_posts_urls = {post["source_url"] for post in processed_posts.data}
-
     for post in subreddit.new(limit=1000):
-       
-        # Check if the post has already been processed
-        if post.url in processed_posts_urls:
-            print(f"Skipping already processed post: {post.title[:60]}...")
-            continue
 
         # Determine if this is a post of interest, if not, skip it
         if not is_post_of_interest(post):
@@ -275,23 +267,22 @@ def scrape_and_store(courses, professors):
                 "created_at": datetime.utcfromtimestamp(comment.created_utc).date().isoformat(),
             }
 
-            # If the course code is None (aka 'general_course'), check if there is an associated professor, if not, skip the comment
-            if temp_course_code is None:
-                if prof_name is not None:
-                    comment_data["course_code"] = "general_course"
-                    supabase.table("rag_chunks").insert(comment_data).execute()
-                    results.append(comment_data)
-
             # If the course code is in the list of valid courses, insert the comment into the database
-            if temp_course_code is not None and temp_course_code in courses:
-                # If the professor name is in the list of valid professors, insert the comment into the database
+            if temp_course_code in courses:
                 if prof_name in professors:
                     comment_data["professor_name"] = prof_name
                 else:
                     comment_data["professor_name"] = 'general_prof'
-                
-                supabase.table("rag_chunks").insert(comment_data).execute()
-                results.append(comment_data)
+
+                try:
+                    supabase.table("rag_chunks").insert(comment_data).execute()
+                    results.append(comment_data)
+                except APIError as e:
+                    code = getattr(e, "code", None) or (e.args[0].get("code") if e.args and isinstance(e.args[0], dict) else None)
+                    if code == "23505":
+                        pass
+                    else:
+                        raise
 
     return results
 

@@ -12,6 +12,7 @@ from selenium.common.exceptions import WebDriverException
 import time
 from textblob import TextBlob
 from supabase import create_client, Client
+from postgrest.exceptions import APIError
 import re
 from datetime import datetime
 import os
@@ -411,26 +412,24 @@ def scrape_professor_comments(supabase, prof, valid_courses):
         ]
 
         # 4) All of the courses that the professor has been reviewed on
-        # Find the dropdown div and click it to open
-        dropdown_button = driver.find_element(By.CLASS_NAME, "Select__getDropdownIndicator-sc-9f4k3m-0")
-        dropdown_button.click()
-
-        # After clicking the dropdown
-        time.sleep(1)  # Wait for animation to open (can also do WebDriverWait instead)
-
-        # Scrape all course options
-        course_menu = driver.find_element(By.CLASS_NAME, "css-1ogydhz-menu")
-        menu_text = course_menu.text
-        # split if by newlines
-        raw_courses = menu_text.split("\n")
-
-        all_courses = set()
-        for course in raw_courses:
-            cleaned = re.sub(r"\(\d+\)", "", course).strip()
-            if cleaned and cleaned.lower() != "all courses":
-                all_courses.add(cleaned)
-
-        course_code_mappings = clean_and_map_course_codes(all_courses, valid_courses)
+        # Find the dropdown div and click it to open (guard against DOM changes)
+        try:
+            dropdown_button = driver.find_element(By.CLASS_NAME, "Select__getDropdownIndicator-sc-9f4k3m-0")
+            dropdown_button.click()
+            time.sleep(1)
+            course_menu = driver.find_element(By.CLASS_NAME, "css-1ogydhz-menu")
+            menu_text = course_menu.text
+            raw_courses = menu_text.split("\n")
+            all_courses = set()
+            for course in raw_courses:
+                cleaned = re.sub(r"\(\d+\)", "", course).strip()
+                if cleaned and cleaned.lower() != "all courses":
+                    all_courses.add(cleaned)
+            course_code_mappings = clean_and_map_course_codes(all_courses, valid_courses)
+        except (NoSuchElementException, Exception) as e:
+            print(f"Could not scrape course dropdown for {prof['name']}, using general_course for all reviews: {e}")
+            all_courses = set()
+            course_code_mappings = {}
 
         # Get all of the previous comments from the database
         response = supabase.table("rag_chunks").select("text", "created_at").eq("professor_name", prof["name"]).execute()
@@ -560,7 +559,15 @@ def scrape_professor_comments(supabase, prof, valid_courses):
             "url": prof["url"],
         }
         
-        supabase.table("professors").upsert(updated_prof, on_conflict=["id"]).execute()
+        try:
+            supabase.table("professors").upsert(updated_prof, on_conflict=["id"]).execute()
+        except APIError as e:
+            code = getattr(e, "code", None) or (e.args[0].get("code") if e.args and isinstance(e.args[0], dict) else None)
+            if code == "23505":
+                # Duplicate name (unique_professor_name): same person, different RMP id — skip upsert, still insert comments
+                print(f"Skipping professor upsert (duplicate name '{prof['name']}'), inserting reviews only.")
+            else:
+                raise
 
         # Insert the reviews into the database (one row per course_code for FK)
         if reviews:
@@ -582,8 +589,12 @@ def scrape_professor_comments(supabase, prof, valid_courses):
                     }
                     comment_data_batch.append(comment_data)
 
-            supabase.table("rag_chunks").insert(comment_data_batch).execute()
-            print(f"Inserted {len(comment_data_batch)} reviews for {prof['name']}")
+            try:
+                supabase.table("rag_chunks").insert(comment_data_batch).execute()
+                print(f"Inserted {len(comment_data_batch)} reviews for {prof['name']}")
+            except APIError as e:
+                code = getattr(e, "code", None) or (e.args[0].get("code") if e.args and isinstance(e.args[0], dict) else None)
+                print(f"Could not insert reviews for {prof['name']} (API error {code}): {e}. Skipping batch.")
         else:
             print(f"No reviews found for {prof['name']}")
 
@@ -611,11 +622,12 @@ if __name__ == "__main__":
     # Iterate through the professors that need to be scraped
     scraped_count = 0
     for prof in professors_to_scrape:
-        scrape_professor_comments(supabase, prof, valid_courses)
-        # Print what the current count is, and the remaining profs to be scraped
+        try:
+            scrape_professor_comments(supabase, prof, valid_courses)
+        except Exception as e:
+            print(f"Error scraping {prof.get('name', 'unknown')} ({prof.get('url', '')}): {e}. Continuing with next professor.")
         scraped_count += 1
         print(f"Scraped {scraped_count}/{count_professors_to_scrape} professors")
-        # Sleep for a bit to avoid being blocked
         time.sleep(1)
 
     print("Scraping complete") 
