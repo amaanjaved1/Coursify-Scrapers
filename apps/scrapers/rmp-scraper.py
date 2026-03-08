@@ -141,7 +141,7 @@ def clean_and_map_course_codes(course_codes, valid_courses):
             else:
                 matches = None
 
-        if len(matches) == 1:
+        if matches is not None and len(matches) == 1:
             course_mapping[raw_code] = matches
         else:
             course_mapping[raw_code] = None
@@ -475,7 +475,7 @@ def scrape_professor_comments(supabase, prof, valid_courses):
 
                         # Get the mapped course code
                         scraped_course_code = block.select_one("div.RatingHeader__StyledClass-sc-1dlkqw1-3").text.strip()
-                        course_codes = course_code_mappings[scraped_course_code]
+                        course_codes = course_code_mappings.get(scraped_course_code)
                         
                         quality_elem = block.select_one("div.CardNumRating__CardNumRatingNumber-sc-17t4b9u-2.ERCLc")
                         difficulty_elem = block.select_one("div.CardNumRating__CardNumRatingNumber-sc-17t4b9u-2.eBKGNg")
@@ -518,7 +518,7 @@ def scrape_professor_comments(supabase, prof, valid_courses):
                             "tags": review_tags,
                             "sentiment_score": sentiment_score,
                             "sentiment_label": sentiment_label,
-                            "course_code": course,
+                            "course_codes": course_codes,
                         }
 
                         reviews.append(parsed_review)
@@ -534,7 +534,8 @@ def scrape_professor_comments(supabase, prof, valid_courses):
                 # Safety: check if it's visible and enabled
                 if load_more_button.is_displayed() and load_more_button.is_enabled():
                     load_more_button.click()
-                    # print("Clicked 'Load More Ratings'")
+                    time.sleep(2)
+                    soup = BeautifulSoup(driver.page_source, "html.parser")
                 else:
                     # print("'Load More Ratings' button not clickable anymore.")
                     break
@@ -561,24 +562,25 @@ def scrape_professor_comments(supabase, prof, valid_courses):
         
         supabase.table("professors").upsert(updated_prof, on_conflict=["id"]).execute()
 
-        # Insert the reviews into the database
+        # Insert the reviews into the database (one row per course_code for FK)
         if reviews:
             comment_data_batch = []
             for review in reviews:
-                comment_data = {
-                    "text": review["comment"],
-                    "source": "ratemyprofessors",
-                    "course_code": review["course_code"],
-                    "professor_name": prof["name"],
-                    "source_url": prof["url"],
-                    "tags": review["tags"],
-                    "created_at": review["date"],
-                    "quality_rating": review["quality"],
-                    "sentiment_score": review["sentiment_score"],
-                    "sentiment_label": review["sentiment_label"],
-                    "difficulty_rating": review["difficulty"],
-                }
-                comment_data_batch.append(comment_data)
+                for code in review["course_codes"]:
+                    comment_data = {
+                        "text": review["comment"],
+                        "source": "ratemyprofessors",
+                        "course_code": code,
+                        "professor_name": prof["name"],
+                        "source_url": prof["url"],
+                        "tags": review["tags"],
+                        "created_at": review["date"],
+                        "quality_rating": review["quality"],
+                        "sentiment_score": review["sentiment_score"],
+                        "sentiment_label": review["sentiment_label"],
+                        "difficulty_rating": review["difficulty"],
+                    }
+                    comment_data_batch.append(comment_data)
 
             supabase.table("rag_chunks").insert(comment_data_batch).execute()
             print(f"Inserted {len(comment_data_batch)} reviews for {prof['name']}")
