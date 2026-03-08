@@ -213,6 +213,7 @@ def clean_text(text):
 def scrape_and_store(courses, professors):
     subreddit = reddit.subreddit("queensuniversity")
     results = []
+    print("Scraping r/queensuniversity (limit 1000 posts)...")
 
     for post in subreddit.new(limit=1000):
 
@@ -277,13 +278,15 @@ def scrape_and_store(courses, professors):
                 try:
                     supabase.table("rag_chunks").insert(comment_data).execute()
                     results.append(comment_data)
+                    print(f"Stored comment: course={temp_course_code}, post={(post.title or '')[:60]}...")
                 except APIError as e:
                     code = getattr(e, "code", None) or (e.args[0].get("code") if e.args and isinstance(e.args[0], dict) else None)
                     if code == "23505":
-                        pass
+                        print(f"Skipped duplicate comment (already in DB).")
                     else:
                         raise
 
+    print(f"Reddit scrape done: {len(results)} comments stored.")
     return results
 
 if __name__ == "__main__":
@@ -302,6 +305,9 @@ if __name__ == "__main__":
     professors = professors_response.data
     professors = [p for p in professors if p["name"] != "general_prof"]
     professors = {p["name"] for p in professors}
+    print(f"Loaded {len(courses)} courses, {len(professors)} professors.")
 
     # Scrape and store comments
     scraped_data = scrape_and_store(courses, professors)
+    print(f"Stored {len(scraped_data)} comments from Reddit.")
+    print("Reddit scrape complete.")
