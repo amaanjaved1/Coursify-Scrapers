@@ -219,9 +219,11 @@ def scrape_professors(supabase, testing=True):
                     num_ratings = card.find_element(By.CLASS_NAME, "CardNumRating__CardNumRatingCount-sc-17t4b9u-3").text # formatted as "X ratings"
                     num_ratings = int(num_ratings.split()[0].replace(",", ""))  # Convert to integer
 
-                    # NEW: Extract href directly from card
+                    # Extract href directly from card; skip if missing
                     prof_url = card.get_attribute("href")
-                    
+                    if not prof_url:
+                        continue
+
                     # Make URL absolute if needed
                     if prof_url.startswith("/"):
                         prof_url = f"https://www.ratemyprofessors.com{prof_url}"

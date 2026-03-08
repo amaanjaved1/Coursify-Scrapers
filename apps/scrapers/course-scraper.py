@@ -65,18 +65,8 @@ def scrape_all_course():
     results = requests.get(art_sci_url, headers=headers)
     art_sci_main_url_content = BeautifulSoup(results.content, "html.parser")
 
-    # #region agent log
-    _log = lambda **kw: open("debug-7f024f.log", "a", encoding="utf-8").write(__import__("json").dumps({"sessionId": "7f024f", "location": "course-scraper.py:art_sci", "timestamp": __import__("time").time() * 1000, **kw}) + "\n")
-    _log(message="art_sci request", data={"status_code": results.status_code, "content_length": len(results.content)}, hypothesisId="H2")
-    # #endregion
-
     # Step 2: Find the embedded links for the course offerings page for each department within the faculty
     art_sci_main_url_content_container = art_sci_main_url_content.find("ul", {"id": "/arts-science/course-descriptions/"})  # get the container element
-
-    # #region agent log
-    _ul_ids = [u.get("id") for u in art_sci_main_url_content.find_all("ul", id=True)]
-    _log(message="container lookup", data={"container_is_none": art_sci_main_url_content_container is None, "ul_ids_in_page": _ul_ids[:30]}, hypothesisId="H1,H3,H4")
-    # #endregion
 
     if art_sci_main_url_content_container is not None:
         art_sci_dept_course_pages = art_sci_main_url_content_container.find_all("a")  # get all the links in the container
