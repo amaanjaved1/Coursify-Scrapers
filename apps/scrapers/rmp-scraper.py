@@ -25,10 +25,11 @@ UNIVERSITY_NAME = "Queen's University at Kingston"
 def create_supabase_client():
     """
     Create a Supabase client using environment variables for URL and key.
+    Prefers SUPABASE_SERVICE_ROLE_KEY when set (bypasses RLS; use in CI/backend).
     """
     SUPABASE_URL = os.getenv("SUPABASE_URL")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-    supabase: Client = create_client(SUPABASE_URL,SUPABASE_KEY)
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
+    supabase: Client = create_client(SUPABASE_URL, key)
     return supabase
 
 def is_valid_comment(comment):
@@ -172,6 +173,9 @@ def scrape_professors(supabase, testing=True):
     options.add_argument("--headless")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--log-level=3")
     driver = webdriver.Chrome(options=options)
 
@@ -306,6 +310,9 @@ def scrape_professor_comments(supabase, prof, valid_courses):
     options.add_argument("--headless")
     options.add_argument("--disable-gpu")
     options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-setuid-sandbox")
     options.add_argument("--log-level=3")
 
     driver = webdriver.Chrome(options=options)

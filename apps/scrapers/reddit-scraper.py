@@ -13,10 +13,11 @@ COURSE_CODE_REGEX = re.compile(r'\b[A-Za-z]{4}\s?\d{3}\b')
 def create_supabase_client():
     """
     Create a Supabase client using environment variables for URL and key.
+    Prefers SUPABASE_SERVICE_ROLE_KEY when set (bypasses RLS; use in CI/backend).
     """
     SUPABASE_URL = os.getenv("SUPABASE_URL")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
+    supabase: Client = create_client(SUPABASE_URL, key)
     return supabase
 
 def setup_reddit():
