@@ -9,6 +9,7 @@ from selenium.common.exceptions import NoSuchElementException
 from selenium.common.exceptions import TimeoutException
 from selenium.common.exceptions import ElementClickInterceptedException
 from selenium.common.exceptions import WebDriverException
+import hashlib
 import time
 from textblob import TextBlob
 from supabase import create_client, Client
@@ -680,15 +681,20 @@ def scrape_professor_comments(supabase, prof, valid_courses):
                         "sentiment_score": review["sentiment_score"],
                         "sentiment_label": review["sentiment_label"],
                         "difficulty_rating": review["difficulty"],
+                        "text_hash": hashlib.md5(review["comment"].encode()).hexdigest(),
                     }
                     comment_data_batch.append(comment_data)
 
             try:
-                supabase.table("rag_chunks").insert(comment_data_batch).execute()
+                supabase.table("rag_chunks").upsert(
+                    comment_data_batch,
+                    on_conflict="source,source_url,text_hash",
+                    ignore_duplicates=True,
+                ).execute()
                 print(f"Inserted {len(comment_data_batch)} reviews for {prof['name']}")
             except APIError as e:
-                code = getattr(e, "code", None) or (e.args[0].get("code") if e.args and isinstance(e.args[0], dict) else None)
-                print(f"Could not insert reviews for {prof['name']} (API error {code}): {e}. Skipping batch.")
+                api_code = getattr(e, "code", None) or (e.args[0].get("code") if e.args and isinstance(e.args[0], dict) else None)
+                print(f"Could not insert reviews for {prof['name']} (API error {api_code}): {e}. Skipping batch.")
         else:
             print(f"No reviews found for {prof['name']}")
 

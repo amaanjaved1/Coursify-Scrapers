@@ -3,6 +3,7 @@ import os
 import re
 import math
 import uuid
+import hashlib
 from datetime import datetime
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
@@ -302,7 +303,15 @@ def scrape_and_store(courses, professors):
     results = []
     print("Scraping r/queensuniversity via .new(), .top(all), .hot()...")
 
+    # Pre-fetch already-stored post URLs to skip posts whose comments are fully stored
+    processed_posts = supabase.table("rag_chunks").select("source_url").eq("source", "reddit").execute()
+    processed_posts_urls = {row["source_url"] for row in processed_posts.data}
+    print(f"  {len(processed_posts_urls)} Reddit post URLs already in DB.")
+
     for post in _iter_unique_posts(subreddit):
+        if post.url in processed_posts_urls:
+            continue
+
 
         if not is_post_of_interest(post):
             continue
@@ -345,19 +354,20 @@ def scrape_and_store(courses, professors):
                 "sentiment_label": sentiment_label,
                 "upvotes": comment.score,
                 "created_at": datetime.utcfromtimestamp(comment.created_utc).date().isoformat(),
+                "text_hash": hashlib.md5(comment.body.encode()).hexdigest(),
             }
 
             if temp_course_code in courses or temp_course_code == "general_course":
-                try:
-                    supabase.table("rag_chunks").insert(comment_data).execute()
+                resp = supabase.table("rag_chunks").upsert(
+                    comment_data,
+                    on_conflict="source,source_url,text_hash",
+                    ignore_duplicates=True,
+                ).execute()
+                if resp.data:
                     results.append(comment_data)
                     print(f"[{post_date}] Stored comment: course={temp_course_code}, prof={resolved_prof}, post={(post.title or '')[:60]}...")
-                except APIError as e:
-                    code = getattr(e, "code", None) or (e.args[0].get("code") if e.args and isinstance(e.args[0], dict) else None)
-                    if code == "23505":
-                        print(f"[{post_date}] Skipped duplicate comment (already in DB).")
-                    else:
-                        raise
+                else:
+                    print(f"[{post_date}] Skipped duplicate comment (already in DB).")
 
     print(f"Reddit scrape done: {len(results)} comments stored.")
     return results

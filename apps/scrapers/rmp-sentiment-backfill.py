@@ -8,6 +8,9 @@ Usage:
     python apps/scrapers/rmp-sentiment-backfill.py
 """
 import os
+import time
+
+import httpx
 from supabase import create_client, Client
 from textblob import TextBlob
 
@@ -27,6 +30,11 @@ RMP_TAG_SENTIMENT = {
     "Test heavy": -0.3, "So many papers": -0.4,
     "Would not take again": -0.9,
 }
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+CHECKPOINT_FILE = os.path.join(SCRIPT_DIR, "backfill_checkpoint.txt")
+MAX_RETRIES = int(os.getenv("RMP_BACKFILL_MAX_RETRIES", "5"))
+PROGRESS_EVERY = int(os.getenv("RMP_BACKFILL_PROGRESS_EVERY", "500"))
 
 
 def detect_sentiment(text, quality_rating=None, difficulty_rating=None, tags=None):
@@ -75,18 +83,47 @@ def create_supabase_client():
     return create_client(SUPABASE_URL, key)
 
 
+def _execute_with_retry(query_builder, action_label):
+    for attempt in range(MAX_RETRIES):
+        try:
+            return query_builder.execute()
+        except (httpx.RemoteProtocolError, httpx.ConnectError, Exception) as exc:
+            if attempt == MAX_RETRIES - 1:
+                print(f"[error] {action_label} failed after {MAX_RETRIES} attempts: {exc}")
+                raise
+            wait_seconds = 2 ** attempt
+            print(
+                f"[warn] {action_label} failed on attempt {attempt + 1}/{MAX_RETRIES}: {exc}. "
+                f"Retrying in {wait_seconds}s..."
+            )
+            time.sleep(wait_seconds)
+
+
+def load_checkpoint():
+    if not os.path.exists(CHECKPOINT_FILE):
+        return set()
+
+    with open(CHECKPOINT_FILE, "r", encoding="utf-8") as checkpoint_file:
+        return {line.strip() for line in checkpoint_file if line.strip()}
+
+
+def save_checkpoint(row_id, checkpoint_fh):
+    checkpoint_fh.write(f"{row_id}\n")
+    checkpoint_fh.flush()
+
+
 def fetch_all_rmp_chunks(supabase):
     """Paginate through all RMP rag_chunks (Supabase caps at 1000 per request)."""
     all_rows = []
     page_size = 1000
     offset = 0
     while True:
-        resp = (
+        resp = _execute_with_retry(
             supabase.table("rag_chunks")
             .select("id, text, quality_rating, difficulty_rating, tags, sentiment_score, sentiment_label")
             .eq("source", "ratemyprofessors")
-            .range(offset, offset + page_size - 1)
-            .execute()
+            .range(offset, offset + page_size - 1),
+            action_label=f"fetch rows {offset}-{offset + page_size - 1}",
         )
         rows = resp.data
         if not rows:
@@ -100,35 +137,68 @@ def fetch_all_rmp_chunks(supabase):
 
 def main():
     supabase = create_supabase_client()
+    processed_ids = load_checkpoint()
+    if processed_ids:
+        print(f"Loaded checkpoint with {len(processed_ids)} processed rows.")
+
     rows = fetch_all_rmp_chunks(supabase)
     print(f"Fetched {len(rows)} RMP rag_chunks to backfill.")
 
     updated = 0
+    processed_this_run = 0
+    skipped_from_checkpoint = 0
     label_changes = {"same": 0}
 
-    for row in rows:
-        new_score, new_label = detect_sentiment(
-            row["text"],
-            quality_rating=row.get("quality_rating"),
-            difficulty_rating=row.get("difficulty_rating"),
-            tags=row.get("tags") or [],
-        )
+    with open(CHECKPOINT_FILE, "a", encoding="utf-8") as checkpoint_fh:
+        for index, row in enumerate(rows, start=1):
+            row_id = str(row["id"])
+            if row_id in processed_ids:
+                skipped_from_checkpoint += 1
+                continue
 
-        old_label = row.get("sentiment_label")
-        if new_score != row.get("sentiment_score") or new_label != old_label:
-            supabase.table("rag_chunks").update({
-                "sentiment_score": new_score,
-                "sentiment_label": new_label,
-            }).eq("id", row["id"]).execute()
-            updated += 1
+            new_score, new_label = detect_sentiment(
+                row["text"],
+                quality_rating=row.get("quality_rating"),
+                difficulty_rating=row.get("difficulty_rating"),
+                tags=row.get("tags") or [],
+            )
 
-            transition = f"{old_label} -> {new_label}"
-            if old_label != new_label:
-                label_changes[transition] = label_changes.get(transition, 0) + 1
-        else:
-            label_changes["same"] += 1
+            old_label = row.get("sentiment_label")
+            if new_score != row.get("sentiment_score") or new_label != old_label:
+                _execute_with_retry(
+                    supabase.table("rag_chunks").update({
+                        "sentiment_score": new_score,
+                        "sentiment_label": new_label,
+                    }).eq("id", row["id"]),
+                    action_label=f"update row {row_id}",
+                )
+                updated += 1
+
+                transition = f"{old_label} -> {new_label}"
+                if old_label != new_label:
+                    label_changes[transition] = label_changes.get(transition, 0) + 1
+            else:
+                label_changes["same"] += 1
+
+            save_checkpoint(row_id, checkpoint_fh)
+            processed_ids.add(row_id)
+            processed_this_run += 1
+
+            if processed_this_run % PROGRESS_EVERY == 0:
+                print(
+                    f"Progress: {index}/{len(rows)} scanned this pass, "
+                    f"{processed_this_run} processed this run, "
+                    f"{updated} updated, {skipped_from_checkpoint} skipped from checkpoint."
+                )
+
+    if os.path.exists(CHECKPOINT_FILE):
+        os.remove(CHECKPOINT_FILE)
 
     print(f"\nBackfill complete: {updated}/{len(rows)} rows updated.")
+    print(
+        f"Rows processed this run: {processed_this_run}. "
+        f"Rows skipped from checkpoint: {skipped_from_checkpoint}."
+    )
     print("Label transitions:")
     for k, v in sorted(label_changes.items(), key=lambda x: -x[1]):
         print(f"  {k}: {v}")
