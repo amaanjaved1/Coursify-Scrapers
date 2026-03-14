@@ -1,6 +1,7 @@
 import praw
 import os
 import re
+import math
 import uuid
 from datetime import datetime
 from supabase import create_client, Client
@@ -9,7 +10,7 @@ from textblob import TextBlob
 
 # Precompiled regex patterns
 PROF_NAME_REGEX = re.compile(r'\b(?:Prof\.?|Dr\.?)\s+[A-Z][a-z]+\s+[A-Z][a-z]+\b')
-COURSE_CODE_REGEX = re.compile(r'\b[A-Za-z]{4}\s?\d{3}\b')
+COURSE_CODE_REGEX = re.compile(r'\b[A-Za-z]{2,4}\s?\d{3}[A-Z]?\b')
 
 def create_supabase_client():
     """
@@ -34,58 +35,119 @@ def setup_reddit():
     )
     return reddit
 
-def detect_sentiment(text):
+def detect_sentiment(text, upvotes=1):
     """
-    Determine the sentiment of a given text using TextBlob.
-    returns a sentiment_score (float between -1 and 1) and a sentiment_label (very positive, positive, neutral, negative, very negative).
+    Composite sentiment: TextBlob polarity weighted with a Reddit upvote confidence signal.
+    upvotes > ~10 amplifies the polarity direction (community agrees), low/negative upvotes dampen it.
+    Returns (sentiment_score, sentiment_label).
     """
     blob = TextBlob(text)
-    sentiment_score = blob.sentiment.polarity
-    if sentiment_score > 0.5:
-        sentiment_label = "very positive"
-    elif sentiment_score > 0.2:
-        sentiment_label = "positive"
-    elif sentiment_score < -0.5:
-        sentiment_label = "very negative"
-    elif sentiment_score < -0.2:
-        sentiment_label = "negative"
-    else:
-        sentiment_label = "neutral"
+    polarity = blob.sentiment.polarity
 
-    return sentiment_score, sentiment_label
+    upvote_signal = math.tanh((upvotes - 1) / 10.0)  # maps ~(-1, 1); 1 upvote -> 0
+    # If polarity and upvotes agree in sign, reinforce; otherwise dampen
+    if polarity >= 0:
+        score = 0.7 * polarity + 0.3 * max(upvote_signal, 0)
+    else:
+        score = 0.7 * polarity + 0.3 * min(upvote_signal, 0)
+
+    score = max(-1.0, min(1.0, score))
+
+    if score > 0.4:
+        label = "very positive"
+    elif score > 0.15:
+        label = "positive"
+    elif score < -0.4:
+        label = "very negative"
+    elif score < -0.15:
+        label = "negative"
+    else:
+        label = "neutral"
+
+    return round(score, 4), label
+
+_NEG_PREFIX = r"(?:not|n't|never|isn't|wasn't|aren't|weren't|doesn't|don't|didn't|hardly|barely)\s+"
 
 def detect_tags(text):
     """
-    Creates tags based on the text content.
+    Assigns canonical tags to a comment for RAG retrieval.
     Returns a list of tags.
-    Possible tag values: easy, hard, professor_review, course_structure (i.e final exams, assignments, workload), tips
     """
     body = text.lower()
     tags = []
 
-    # Preprocessing: detect negations manually
-    is_not_easy = bool(re.search(r"not\s+(easy|light|bird course|straightforward)", body))
-    is_not_hard = bool(re.search(r"not\s+(hard|tough|difficult|challenging|brutal|intense)", body))
+    is_not_easy = bool(re.search(_NEG_PREFIX + r"(easy|light|bird course|straightforward|manageable|simple|chill)", body))
+    is_not_hard = bool(re.search(_NEG_PREFIX + r"(hard|tough|difficult|challenging|brutal|intense|heavy|killer)", body))
 
-    # Difficulty (easy)
-    if not is_not_easy and any(word in body for word in ["easy", "light", "bird course", "manageable", "straightforward"]):
+    easy_words = [
+        "easy", "light", "bird course", "manageable", "straightforward",
+        "simple", "chill", "gpa booster", "gut course", "easy a",
+    ]
+    hard_words = [
+        "hard", "tough", "difficult", "challenging", "brutal", "intense",
+        "heavy", "killer", "weed-out", "weed out", "insane workload",
+    ]
+
+    if not is_not_easy and any(w in body for w in easy_words):
         tags.append("easy")
-
-    # Difficulty (hard)
-    if not is_not_hard and any(word in body for word in ["hard", "tough", "difficult", "challenging", "brutal", "intense"]):
+    if not is_not_hard and any(w in body for w in hard_words):
         tags.append("hard")
 
-    # Professor reviews
-    if any(word in body for word in ["professor", "lecturer", "teaching", "instructor", "teaches", "taught"]):
+    if any(w in body for w in [
+        "professor", "prof ", "prof.", "lecturer", "teaching", "instructor",
+        "teaches", "taught", "dr.", "office hours",
+    ]):
         tags.append("professor_review")
 
-    # Course structure (exams, assignments, workload)
-    if any(word in body for word in ["exam", "midterm", "final", "assignment", "homework", "reading", "workload", "labs", "quizzes", "group project"]):
+    if any(w in body for w in [
+        "exam", "midterm", "final", "assignment", "homework", "reading",
+        "workload", "labs", "quizzes", "group project", "project", "lab report",
+        "tutorial", "lecture", "seminar", "presentation",
+    ]):
         tags.append("course_structure")
 
-    # Tips and advice
-    if any(word in body for word in ["recommend", "tip", "advice", "suggest", "strategy", "resource", "how to study"]):
+    if any(w in body for w in [
+        "recommend", "tip", "advice", "suggest", "strategy", "resource",
+        "how to study", "study guide", "practice problems",
+    ]):
         tags.append("tips")
+
+    if any(w in body for w in [
+        "bell curve", "curved", "harsh grading", "harsh marker", "lenient",
+        "fair grading", "easy marker", "tough grader", "grade inflation",
+    ]):
+        tags.append("grading")
+
+    if any(w in body for w in [
+        "heavy workload", "time-consuming", "time consuming", "reading-heavy",
+        "reading heavy", "hours per week", "weekly", "constant work",
+    ]):
+        tags.append("workload")
+
+    if any(w in body for w in [
+        "online", "remote", "hybrid", "recorded", "asynchronous", "async",
+        "zoom", "virtual",
+    ]):
+        tags.append("online")
+
+    if any(w in body for w in [
+        "group project", "group assignment", "teamwork", "partner", "team-based",
+        "group work", "group presentation",
+    ]):
+        tags.append("group_work")
+
+    if any(w in body for w in [
+        "would recommend", "take this", "must take", "highly recommend",
+        "avoid", "don't take", "do not take", "skip this", "worst course",
+        "best course", "loved this", "hated this",
+    ]):
+        tags.append("recommendation")
+
+    if any(w in body for w in [
+        "exam-heavy", "exam heavy", "multiple choice", "written exam",
+        "open book", "closed book", "cheat sheet", "proctored",
+    ]):
+        tags.append("exam_heavy")
 
     return tags
 
@@ -146,59 +208,67 @@ def is_comment_of_interest(comment):
     # ✅ Passed all checks
     return True
 
+def _normalize_course_code(raw):
+    """'cisc121' / 'CISC 121A' -> 'CISC 121'  (strip optional suffix letter, insert space)."""
+    code = raw.replace(" ", "").upper()
+    return re.sub(r"([A-Z]{2,4})(\d{3})[A-Z]?", r"\1 \2", code)
+
 def extract_course_code_from_post(post):
     full_text = f"{post.title} {post.selftext}"
     match = COURSE_CODE_REGEX.search(full_text)
-    
-    if match:
-        course_code = match.group(0).replace(" ", "").upper()
-        # Insert a space between letters and digits
-        course_code = re.sub(r"([A-Z]{4})(\d{3})", r"\1 \2", course_code)
-        return course_code
-    else:
-        return None
+    return _normalize_course_code(match.group(0)) if match else None
 
 def extract_course_code_from_comment(comment):
     match = COURSE_CODE_REGEX.search(comment.body)
-    
-    if match:
-        course_code = match.group(0).replace(" ", "").upper()
-        course_code = re.sub(r"([A-Z]{4})(\d{3})", r"\1 \2", course_code)
-        return course_code
-    else:
-        return None
+    return _normalize_course_code(match.group(0)) if match else None
+
+GENERAL_COURSE_KEYWORDS = [
+    # Original
+    "courses", "course", "classes", "electives", "program requirements", "bird courses", "easy a",
+    # Registration / planning
+    "enrol", "enrollment", "registration", "timetable", "schedule", "prerequisite",
+    "corequisite", "waitlist", "add/drop", "degree requirements", "academic plan",
+    "course load", "overload", "breadth requirement", "solus",
+    # Grading / assessment
+    "gpa", "grade", "grading", "bell curve", "curved", "pass/fail", "dean's list",
+    "transcript", "credit", "unit",
+    # Workload
+    "workload", "readings", "assignments", "midterm", "final exam", "essay",
+    "lab", "tutorial", "lecture",
+    # General academic
+    "major", "minor", "specialization", "concentration", "faculty", "department",
+    "ta ", "office hours", "syllabus",
+    # Slang / colloquial
+    "bird course", "gpa booster", "gut course", "brutal", "weed-out", "weed out",
+    # Professor-related
+    "professor", "prof ", "prof.", "instructor", "lecturer", "dr.",
+]
 
 def is_post_of_interest(post):
-    # Filter: must be a self post (not a link post)
     if not post.is_self:
         return False
 
-    # Filter: must NOT be NSFW
     if post.over_18:
         return False
 
-    # Filter: must have non-empty body
+    full_text = post.title.lower() + " " + (post.selftext or "").lower()
+    has_course_code = bool(re.search(COURSE_CODE_REGEX.pattern, full_text))
+    has_keyword = any(kw in full_text for kw in GENERAL_COURSE_KEYWORDS)
+
+    # Allow empty body only when the *title* alone contains a course code or keyword
     if not post.selftext.strip():
+        if not (has_course_code or has_keyword):
+            return False
+
+    if not (has_course_code or has_keyword):
         return False
 
-    # Must mention either a course code OR general course-related keywords
-    course_code_regex = r'\b[A-Za-z]{4}\s?\d{3}\b'
-    general_course_keywords = ["courses", "course", "classes", "electives", "program requirements", "bird courses", "easy A"]
-
-    full_text = post.title.lower() + " " + post.selftext.lower()
-
-    if not (re.search(course_code_regex, full_text) or any(keyword in full_text for keyword in general_course_keywords)):
-        return False
-
-    # (Optional) Filter: avoid locked posts
     if post.locked:
         return False
 
-    # (Optional) Filter: require some engagement
     if post.score < 2 or post.num_comments == 0:
         return False
 
-    # ✅ Otherwise, looks interesting!
     return True
     
 def clean_text(text):
@@ -210,50 +280,59 @@ def clean_text(text):
     text = re.sub(r'^[a-z]\)', '-', text, flags=re.MULTILINE)
     return text
 
+def _iter_unique_posts(subreddit, limit=1000):
+    """Yield posts from .new(), .top(all), and .hot(), deduplicating by post ID."""
+    seen_ids = set()
+    sources = [
+        ("new", subreddit.new(limit=limit)),
+        ("top(all)", subreddit.top(time_filter="all", limit=limit)),
+        ("hot", subreddit.hot(limit=limit)),
+    ]
+    for label, listing in sources:
+        count = 0
+        for post in listing:
+            if post.id not in seen_ids:
+                seen_ids.add(post.id)
+                yield post
+                count += 1
+        print(f"  [{label}] yielded {count} unique posts (total unique so far: {len(seen_ids)})")
+
 def scrape_and_store(courses, professors):
     subreddit = reddit.subreddit("queensuniversity")
     results = []
-    print("Scraping r/queensuniversity (limit 1000 posts)...")
+    print("Scraping r/queensuniversity via .new(), .top(all), .hot()...")
 
-    for post in subreddit.new(limit=1000):
+    for post in _iter_unique_posts(subreddit):
 
-        # Determine if this is a post of interest, if not, skip it
         if not is_post_of_interest(post):
             continue
-        
-        # If the post title/description contains a course code, extract it, otherwise set to None
-        course_code = extract_course_code_from_post(post)
-        if not course_code:
-            course_code = None
 
-        # If the post title/description contains a prof name, extract it, otherwise set to None
-        prof_name = extract_prof_name_from_post(post)
-        if not prof_name:
-            prof_name = None
+        post_date = datetime.utcfromtimestamp(post.created_utc).strftime("%Y-%m-%d")
+        course_code = extract_course_code_from_post(post) or None
+        post_prof_name = extract_prof_name_from_post(post) or None
 
-        # Iterate through the comments of the post
         post.comments.replace_more(limit=None)
         for comment in post.comments:
-            # Check to see if the comment is a valid comment
             if not is_comment_of_interest(comment):
                 continue
-            
-            # If course_code is not None, use it, otherwise try to find the course code in the comment.
-            # If that fails, skip the comment.
-            # This is to ensure that we have a course code for every comment.
+
             temp_course_code = course_code or extract_course_code_from_comment(comment)
+
+            # Per-comment prof detection (avoid leaking across comments)
+            comment_prof = post_prof_name or extract_prof_name_from_comment(comment)
+
+            # If no course code found, allow storage only when a known professor is referenced
             if not temp_course_code:
-                continue
+                if comment_prof and comment_prof in professors:
+                    temp_course_code = "general_course"
+                else:
+                    continue
 
-            # If the professor name is not None, use it, otherwise try to find the professor name in the comment.
-            if not prof_name:
-                prof_name = extract_prof_name_from_comment(comment)
-
-            # Extract tags from the comment
             tags = detect_tags(comment.body)
+            sentiment_score, sentiment_label = detect_sentiment(comment.body, upvotes=comment.score)
 
-            # Extract sentiment from the comment
-            sentiment_score, sentiment_label = detect_sentiment(comment.body)
+            # Resolve professor: use known name or fall back to general_prof
+            resolved_prof = comment_prof if comment_prof in professors else "general_prof"
 
             comment_data = {
                 "text": comment.body,
@@ -261,28 +340,22 @@ def scrape_and_store(courses, professors):
                 "course_code": temp_course_code,
                 "source_url": post.url,
                 "tags": tags,
-                "professor_name": prof_name,
+                "professor_name": resolved_prof,
                 "sentiment_score": sentiment_score,
                 "sentiment_label": sentiment_label,
                 "upvotes": comment.score,
                 "created_at": datetime.utcfromtimestamp(comment.created_utc).date().isoformat(),
             }
 
-            # If the course code is in the list of valid courses, insert the comment into the database
-            if temp_course_code in courses:
-                if prof_name in professors:
-                    comment_data["professor_name"] = prof_name
-                else:
-                    comment_data["professor_name"] = 'general_prof'
-
+            if temp_course_code in courses or temp_course_code == "general_course":
                 try:
                     supabase.table("rag_chunks").insert(comment_data).execute()
                     results.append(comment_data)
-                    print(f"Stored comment: course={temp_course_code}, post={(post.title or '')[:60]}...")
+                    print(f"[{post_date}] Stored comment: course={temp_course_code}, prof={resolved_prof}, post={(post.title or '')[:60]}...")
                 except APIError as e:
                     code = getattr(e, "code", None) or (e.args[0].get("code") if e.args and isinstance(e.args[0], dict) else None)
                     if code == "23505":
-                        print(f"Skipped duplicate comment (already in DB).")
+                        print(f"[{post_date}] Skipped duplicate comment (already in DB).")
                     else:
                         raise
 
