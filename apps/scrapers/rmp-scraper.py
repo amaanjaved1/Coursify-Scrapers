@@ -149,25 +149,76 @@ def clean_and_map_course_codes(course_codes, valid_courses):
 
     return course_mapping   
 
-def detect_sentiment(text):
+RMP_TAG_SENTIMENT = {
+    # Positive tags
+    "Amazing lectures": 0.8, "Inspirational": 0.9, "Respected": 0.7,
+    "Caring": 0.7, "Hilarious": 0.6, "Accessible outside class": 0.6,
+    "Clear grading criteria": 0.5, "Gives good feedback": 0.6,
+    "Would take again": 0.8, "Participation matters": 0.1,
+    "Lecture heavy": 0.0, "Tests? Not many": 0.2, "Extra credit": 0.3,
+    "Graded by few things": -0.1, "Group projects": 0.0,
+    "Online savvy": 0.2, "Beware of pop quizzes": -0.2,
+    # Negative tags
+    "Tough grader": -0.4, "Skip class? You won't pass.": -0.3,
+    "Get ready to read": -0.3, "Lots of homework": -0.4,
+    "Test heavy": -0.3, "So many papers": -0.4,
+    "Would not take again": -0.9,
+}
+
+def detect_sentiment(text, quality_rating=None, difficulty_rating=None, tags=None):
     """
-    Determine the sentiment of a given text using TextBlob.
-    returns a sentiment_score (float between -1 and 1) and a sentiment_label (very positive, positive, neutral, negative, very negative).
+    Composite sentiment for RMP reviews.
+    Blends TextBlob polarity (0.35), quality rating (0.40), difficulty context (0.15),
+    and RMP tag signal (0.10) into a single -1..1 score.
     """
     blob = TextBlob(text)
-    sentiment_score = blob.sentiment.polarity
-    if sentiment_score > 0.5:
-        sentiment_label = "very positive"
-    elif sentiment_score > 0.2:
-        sentiment_label = "positive"
-    elif sentiment_score < -0.5:
-        sentiment_label = "very negative"
-    elif sentiment_score < -0.2:
-        sentiment_label = "negative"
-    else:
-        sentiment_label = "neutral"
+    text_polarity = blob.sentiment.polarity
 
-    return sentiment_score, sentiment_label
+    # Quality rating (1-5) normalized to -1..1
+    if quality_rating is not None:
+        quality_signal = (quality_rating - 3.0) / 2.0
+    else:
+        quality_signal = 0.0
+
+    # Difficulty context: high difficulty + low quality = negative nudge
+    difficulty_signal = 0.0
+    if difficulty_rating is not None and quality_rating is not None:
+        if difficulty_rating >= 4.0 and quality_rating <= 2.0:
+            difficulty_signal = -0.6
+        elif difficulty_rating >= 4.0 and quality_rating <= 3.0:
+            difficulty_signal = -0.3
+        elif difficulty_rating <= 2.0 and quality_rating >= 4.0:
+            difficulty_signal = 0.4
+        else:
+            difficulty_signal = (3.0 - difficulty_rating) / 5.0
+
+    # Tag signal
+    tag_signal = 0.0
+    if tags:
+        tag_scores = [RMP_TAG_SENTIMENT.get(t, 0.0) for t in tags]
+        if tag_scores:
+            tag_signal = sum(tag_scores) / len(tag_scores)
+
+    score = (
+        0.35 * text_polarity
+        + 0.40 * quality_signal
+        + 0.15 * difficulty_signal
+        + 0.10 * tag_signal
+    )
+    score = max(-1.0, min(1.0, round(score, 4)))
+
+    if score > 0.4:
+        label = "very positive"
+    elif score > 0.15:
+        label = "positive"
+    elif score < -0.4:
+        label = "very negative"
+    elif score < -0.15:
+        label = "negative"
+    else:
+        label = "neutral"
+
+    return score, label
 
 def scrape_professors(supabase, testing=True):
     url = f"https://www.ratemyprofessors.com/search/professors/{UNIVERSITY_ID}?q=*"
@@ -296,8 +347,43 @@ def scrape_professors(supabase, testing=True):
 
     return professors
 
+RMP_TAG_TO_CANONICAL = {
+    "Tough grader": ["hard", "grading"],
+    "Clear grading criteria": ["grading"],
+    "Graded by few things": ["grading"],
+    "Inspirational": ["professor_review"],
+    "Amazing lectures": ["professor_review"],
+    "Respected": ["professor_review"],
+    "Caring": ["professor_review"],
+    "Hilarious": ["professor_review"],
+    "Accessible outside class": ["professor_review"],
+    "Gives good feedback": ["professor_review"],
+    "Lots of homework": ["workload"],
+    "Get ready to read": ["workload"],
+    "So many papers": ["workload"],
+    "Group projects": ["group_work"],
+    "Test heavy": ["exam_heavy"],
+    "Beware of pop quizzes": ["exam_heavy"],
+    "Tests? Not many": ["course_structure"],
+    "Skip class? You won't pass.": ["course_structure"],
+    "Lecture heavy": ["course_structure"],
+    "Participation matters": ["course_structure"],
+    "Online savvy": ["online"],
+    "Extra credit": ["tips"],
+    "Would take again": ["recommendation"],
+    "Would not take again": ["recommendation"],
+}
+
+def normalize_rmp_tags(raw_tags):
+    """Map raw RMP tags to canonical tag set, returning deduplicated canonical tags."""
+    canonical = set()
+    for tag in raw_tags:
+        for mapped in RMP_TAG_TO_CANONICAL.get(tag, []):
+            canonical.add(mapped)
+    return sorted(canonical)
+
 def normalize_comment(text):
-    return re.sub(r"\s+", " ", text.strip().lower())    
+    return re.sub(r"\s+", " ", text.strip().lower())
 
 def to_scrape_professor(supabase, professors):
     '''
@@ -495,10 +581,15 @@ def scrape_professor_comments(supabase, prof, valid_courses):
                         if not is_valid_comment(comment):
                             continue
 
-                        sentiment_score, sentiment_label = detect_sentiment(comment)
-                    
                         tag_spans = block.select("span.Tag-bs9vf4-0")
                         review_tags = [tag.text.strip() for tag in tag_spans]
+
+                        sentiment_score, sentiment_label = detect_sentiment(
+                            comment,
+                            quality_rating=quality,
+                            difficulty_rating=difficulty,
+                            tags=review_tags,
+                        )
 
                         if not course_codes:
                             course_codes = ["general_course"]
@@ -509,12 +600,15 @@ def scrape_professor_comments(supabase, prof, valid_courses):
                             continue
                         seen_reviews_set.add((normalized_comment, date))
 
+                        canonical_tags = normalize_rmp_tags(review_tags)
+
                         parsed_review = {
                             "date": date,
                             "quality": quality,
                             "difficulty": difficulty,
                             "comment": normalized_comment,
                             "tags": review_tags,
+                            "canonical_tags": canonical_tags,
                             "sentiment_score": sentiment_score,
                             "sentiment_label": sentiment_label,
                             "course_codes": course_codes,
@@ -580,7 +674,7 @@ def scrape_professor_comments(supabase, prof, valid_courses):
                         "course_code": code,
                         "professor_name": prof["name"],
                         "source_url": prof["url"],
-                        "tags": review["tags"],
+                        "tags": review["canonical_tags"] + review["tags"],
                         "created_at": review["date"],
                         "quality_rating": review["quality"],
                         "sentiment_score": review["sentiment_score"],
