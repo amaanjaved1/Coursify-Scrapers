@@ -9,10 +9,11 @@ import numpy as np
 def create_supabase_client():
     """
     Create a Supabase client using environment variables for URL and key.
+    Prefers SUPABASE_SERVICE_ROLE_KEY when set (bypasses RLS; use in CI/backend).
     """
     SUPABASE_URL = os.getenv("SUPABASE_URL")
-    SUPABASE_KEY = os.getenv("SUPABASE_KEY")
-    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    key = os.getenv("SUPABASE_SERVICE_ROLE_KEY") or os.getenv("SUPABASE_KEY")
+    supabase: Client = create_client(SUPABASE_URL, key)
     return supabase
 
 
@@ -65,19 +66,36 @@ def scrape_all_course():
     art_sci_main_url_content = BeautifulSoup(results.content, "html.parser")
 
     # Step 2: Find the embedded links for the course offerings page for each department within the faculty
-    art_sci_main_url_content_container = art_sci_main_url_content.find("div", class_="sitemap") # get the container element
-    art_sci_dept_course_pages = art_sci_main_url_content_container.find_all("a") # get all the links in the container
+    art_sci_main_url_content_container = art_sci_main_url_content.find("ul", {"id": "/arts-science/course-descriptions/"})  # get the container element
+
+    if art_sci_main_url_content_container is not None:
+        art_sci_dept_course_pages = art_sci_main_url_content_container.find_all("a")  # get all the links in the container
+    else:
+        # Fallback: department links are /academic-calendar/arts-science/course-descriptions/<dept>/ (one segment after course-descriptions/)
+        def _is_dept_href(h):
+            if not h or "arts-science/course-descriptions/" not in h or "crse-mode" in h:
+                return False
+            parts = h.replace("https://www.queensu.ca", "").strip("/").split("/")
+            try:
+                i = parts.index("course-descriptions")
+                return len(parts) > i + 1 and (len(parts) == i + 2 or (len(parts) == i + 3 and parts[-1] == ""))
+            except ValueError:
+                return False
+
+        art_sci_dept_course_pages = [a for a in art_sci_main_url_content.select('a[href*="arts-science/course-descriptions/"]') if _is_dept_href(a.get("href"))]
 
     # Step 3: For each department, go through the courses offered and scrape the data
     for dept_course_page in art_sci_dept_course_pages:
-                
+
         # Get the URL and name of the department course page
         dept_course_page_url = dept_course_page.get("href")
         dept_course_page_name = dept_course_page.get_text(strip=True)
+        _req_url = dept_course_page_url if (dept_course_page_url or "").startswith("http") else "https://www.queensu.ca" + ((dept_course_page_url or "") if (dept_course_page_url or "").startswith("/") else "/" + (dept_course_page_url or ""))
+
         print(f"Scraping {dept_course_page_name} courses...")
-        
+
         # Make a request to the department course page
-        dept_course_page_results = requests.get("https://www.queensu.ca" + dept_course_page_url, headers=headers)
+        dept_course_page_results = requests.get(_req_url, headers=headers)
         dept_course_page_content = BeautifulSoup(dept_course_page_results.content, "html.parser")
         
         # Get each course from the department course page
