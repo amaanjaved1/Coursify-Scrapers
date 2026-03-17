@@ -7,7 +7,13 @@ import hashlib
 from datetime import datetime
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
-from textblob import TextBlob
+from transformers import pipeline
+
+_sentiment_pipeline = pipeline(
+    "sentiment-analysis",
+    model="distilbert-base-uncased-finetuned-sst-2-english",
+    device=-1,
+)
 
 # Precompiled regex patterns
 PROF_NAME_REGEX = re.compile(r'\b(?:Prof\.?|Dr\.?)\s+[A-Z][a-z]+\s+[A-Z][a-z]+\b')
@@ -38,12 +44,14 @@ def setup_reddit():
 
 def detect_sentiment(text, upvotes=1):
     """
-    Composite sentiment: TextBlob polarity weighted with a Reddit upvote confidence signal.
+    Composite sentiment: distilbert polarity weighted with a Reddit upvote confidence signal.
     upvotes > ~10 amplifies the polarity direction (community agrees), low/negative upvotes dampen it.
     Returns (sentiment_score, sentiment_label).
     """
-    blob = TextBlob(text)
-    polarity = blob.sentiment.polarity
+    result = _sentiment_pipeline(text[:512])[0]
+    raw_label = result["label"]
+    confidence = result["score"]
+    polarity = confidence if raw_label == "POSITIVE" else -confidence
 
     upvote_signal = math.tanh((upvotes - 1) / 10.0)  # maps ~(-1, 1); 1 upvote -> 0
     # If polarity and upvotes agree in sign, reinforce; otherwise dampen
@@ -54,13 +62,13 @@ def detect_sentiment(text, upvotes=1):
 
     score = max(-1.0, min(1.0, score))
 
-    if score > 0.4:
+    if score > 0.85:
         label = "very positive"
-    elif score > 0.15:
+    elif score > 0.5:
         label = "positive"
-    elif score < -0.4:
+    elif score < -0.85:
         label = "very negative"
-    elif score < -0.15:
+    elif score < -0.5:
         label = "negative"
     else:
         label = "neutral"

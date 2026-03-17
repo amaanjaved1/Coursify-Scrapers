@@ -11,7 +11,7 @@ from selenium.common.exceptions import ElementClickInterceptedException
 from selenium.common.exceptions import WebDriverException
 import hashlib
 import time
-from textblob import TextBlob
+from transformers import pipeline
 from supabase import create_client, Client
 from postgrest.exceptions import APIError
 import re
@@ -150,71 +150,33 @@ def clean_and_map_course_codes(course_codes, valid_courses):
 
     return course_mapping   
 
-RMP_TAG_SENTIMENT = {
-    # Positive tags
-    "Amazing lectures": 0.8, "Inspirational": 0.9, "Respected": 0.7,
-    "Caring": 0.7, "Hilarious": 0.6, "Accessible outside class": 0.6,
-    "Clear grading criteria": 0.5, "Gives good feedback": 0.6,
-    "Would take again": 0.8, "Participation matters": 0.1,
-    "Lecture heavy": 0.0, "Tests? Not many": 0.2, "Extra credit": 0.3,
-    "Graded by few things": -0.1, "Group projects": 0.0,
-    "Online savvy": 0.2, "Beware of pop quizzes": -0.2,
-    # Negative tags
-    "Tough grader": -0.4, "Skip class? You won't pass.": -0.3,
-    "Get ready to read": -0.3, "Lots of homework": -0.4,
-    "Test heavy": -0.3, "So many papers": -0.4,
-    "Would not take again": -0.9,
-}
+_sentiment_pipeline = pipeline(
+    "sentiment-analysis",
+    model="distilbert-base-uncased-finetuned-sst-2-english",
+    device=-1,
+)
 
-def detect_sentiment(text, quality_rating=None, difficulty_rating=None, tags=None):
+
+def detect_sentiment(text):
     """
-    Composite sentiment for RMP reviews.
-    Blends TextBlob polarity (0.35), quality rating (0.40), difficulty context (0.15),
-    and RMP tag signal (0.10) into a single -1..1 score.
+    Text-only sentiment using distilbert.
+    Returns a (-1..1) score and a human-readable label.
+    Quality/difficulty ratings are stored as separate structured fields.
     """
-    blob = TextBlob(text)
-    text_polarity = blob.sentiment.polarity
+    result = _sentiment_pipeline(text[:512])[0]
+    raw_label = result["label"]
+    confidence = result["score"]
 
-    # Quality rating (1-5) normalized to -1..1
-    if quality_rating is not None:
-        quality_signal = (quality_rating - 3.0) / 2.0
-    else:
-        quality_signal = 0.0
+    score = confidence if raw_label == "POSITIVE" else -confidence
+    score = round(score, 4)
 
-    # Difficulty context: high difficulty + low quality = negative nudge
-    difficulty_signal = 0.0
-    if difficulty_rating is not None and quality_rating is not None:
-        if difficulty_rating >= 4.0 and quality_rating <= 2.0:
-            difficulty_signal = -0.6
-        elif difficulty_rating >= 4.0 and quality_rating <= 3.0:
-            difficulty_signal = -0.3
-        elif difficulty_rating <= 2.0 and quality_rating >= 4.0:
-            difficulty_signal = 0.4
-        else:
-            difficulty_signal = (3.0 - difficulty_rating) / 5.0
-
-    # Tag signal
-    tag_signal = 0.0
-    if tags:
-        tag_scores = [RMP_TAG_SENTIMENT.get(t, 0.0) for t in tags]
-        if tag_scores:
-            tag_signal = sum(tag_scores) / len(tag_scores)
-
-    score = (
-        0.35 * text_polarity
-        + 0.40 * quality_signal
-        + 0.15 * difficulty_signal
-        + 0.10 * tag_signal
-    )
-    score = max(-1.0, min(1.0, round(score, 4)))
-
-    if score > 0.4:
+    if score > 0.85:
         label = "very positive"
-    elif score > 0.15:
+    elif score > 0.5:
         label = "positive"
-    elif score < -0.4:
+    elif score < -0.85:
         label = "very negative"
-    elif score < -0.15:
+    elif score < -0.5:
         label = "negative"
     else:
         label = "neutral"
@@ -570,11 +532,13 @@ def scrape_professor_comments(supabase, prof, valid_courses):
                             quality = float(quality_elem.text.strip())
                         else:
                             quality = overall_rating  # fallback
-                        
+                            print(f"  ⚠ Using professor overall rating as fallback for review quality ({prof['name']})")
+
                         if difficulty_elem:
                             difficulty = float(difficulty_elem.text.strip())
                         else:
                             difficulty = level_of_difficulty  # fallback
+                            print(f"  ⚠ Using professor overall difficulty as fallback for review difficulty ({prof['name']})")
                         
                         comment = block.select_one("div.Comments__StyledComments-dzzyvm-0").text.strip()
                         
@@ -585,12 +549,7 @@ def scrape_professor_comments(supabase, prof, valid_courses):
                         tag_spans = block.select("span.Tag-bs9vf4-0")
                         review_tags = [tag.text.strip() for tag in tag_spans]
 
-                        sentiment_score, sentiment_label = detect_sentiment(
-                            comment,
-                            quality_rating=quality,
-                            difficulty_rating=difficulty,
-                            tags=review_tags,
-                        )
+                        sentiment_score, sentiment_label = detect_sentiment(comment)
 
                         if not course_codes:
                             course_codes = ["general_course"]
