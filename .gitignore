@@ -4,3 +4,4 @@ apps/scrapers/venv
 apps/redis/redis-test.py
 .claude/
 apps/scrapers/__pycache__/
+apps/scrapers/finetune_sentiment.ipynb

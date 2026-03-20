@@ -137,31 +137,37 @@ def clean_and_map_course_codes(course_codes, valid_courses):
 
 _sentiment_pipeline = pipeline(
     "sentiment-analysis",
-    model="distilbert-base-uncased-finetuned-sst-2-english",
+    model="CoursifyQU/student-review-sentiment",
     device=-1,
 )
 
 
 def detect_sentiment(text):
     """
-    Text-only sentiment using distilbert.
+    Text-only sentiment using fine-tuned RoBERTa model trained on 18K+ Queen's student reviews.
     Returns a (-1..1) score and a human-readable label.
     Quality/difficulty ratings are stored as separate structured fields.
     """
-    result = _sentiment_pipeline(text[:512])[0]
-    raw_label = result["label"]
+    result = _sentiment_pipeline(text[:2000])[0]
+    raw_label = result["label"]       # "negative", "neutral", or "positive"
     confidence = result["score"]
 
-    score = confidence if raw_label == "POSITIVE" else -confidence
+    if raw_label == "positive":
+        score = confidence
+    elif raw_label == "negative":
+        score = -confidence
+    else:
+        score = 0.0  # neutral
+
     score = round(score, 4)
 
     if score > 0.85:
         label = "very positive"
-    elif score > 0.5:
+    elif score > 0.3:
         label = "positive"
     elif score < -0.85:
         label = "very negative"
-    elif score < -0.5:
+    elif score < -0.3:
         label = "negative"
     else:
         label = "neutral"
@@ -174,11 +180,16 @@ def scrape_professors(client, supabase, testing=True):
     """
     professors = []
     seen_names = set()
+    duplicates_skipped = 0
 
-    print(f"Fetching professors for {UNIVERSITY_NAME} (ID: {UNIVERSITY_ID})...")
+    print(f"\n{'='*60}")
+    print(f"PHASE 1: Fetching professors for {UNIVERSITY_NAME} (ID: {UNIVERSITY_ID})")
+    print(f"{'='*60}")
+    start_time = time.time()
 
     for prof in client.iter_professors_for_school(UNIVERSITY_ID):
         if prof.name in seen_names:
+            duplicates_skipped += 1
             continue
         seen_names.add(prof.name)
 
@@ -195,12 +206,16 @@ def scrape_professors(client, supabase, testing=True):
             "url": prof_url,
         })
 
-        print(f"{prof.name} extracted")
-
         if testing and len(professors) > 20:
             break
 
-    print(f"Total professors fetched: {len(professors)}")
+    elapsed = time.time() - start_time
+    print(f"  Fetched {len(professors)} professors in {elapsed:.1f}s")
+    if duplicates_skipped:
+        print(f"  Skipped {duplicates_skipped} duplicate names")
+    with_ratings = sum(1 for p in professors if p["num_ratings"] > 0)
+    without_ratings = len(professors) - with_ratings
+    print(f"  {with_ratings} with ratings, {without_ratings} with no ratings")
     return professors
 
 RMP_TAG_TO_CANONICAL = {
@@ -246,6 +261,9 @@ def to_scrape_professor(supabase, professors):
     Returns a list of the professors that need to be scraped.
     '''
     professors_to_scrape = []
+    new_professors = 0
+    updated_professors = 0
+    up_to_date = 0
 
     # Query the database for the professors that have already been scraped - from the professors table get the name, num_ratings, latest_comment_date - ignore the entry where the name is 'general_professor'
     previous_professors = supabase.table("professors").select("name, num_ratings, latest_comment_date").execute().data
@@ -255,29 +273,44 @@ def to_scrape_professor(supabase, professors):
         if prof["name"] != "general_prof"
     }
 
+    print(f"\n{'='*60}")
+    print(f"PHASE 2: Delta detection")
+    print(f"{'='*60}")
+    print(f"  Professors in DB: {len(previous_professors_dict)}")
+    print(f"  Professors from API: {len(professors)}")
+
     # Iterate through the professors scraped from the website
     for prof in professors:
         # Check if the professor is already in the database
         if prof["name"] in previous_professors_dict:
+            db_count = previous_professors_dict[prof["name"]][0]
             # If the num_ratings is different, we need to scrape it again
-            if prof["num_ratings"] != previous_professors_dict[prof["name"]][0]:
+            if prof["num_ratings"] != db_count:
                 # Also, attach the latest_comment_date to the professor object
                 prof["latest_comment_date"] = previous_professors_dict[prof["name"]][1]
                 professors_to_scrape.append(prof)
+                updated_professors += 1
+                delta = prof["num_ratings"] - (db_count or 0)
+                print(f"  [UPDATED] {prof['name']}: {db_count} -> {prof['num_ratings']} ratings (+{delta})")
+            else:
+                up_to_date += 1
         else:
             # If the professor is not in the database, we need to scrape it
             # Since they have not been scraped before, we can assume the latest_comment_date is None
             prof["latest_comment_date"] = None
             professors_to_scrape.append(prof)
+            new_professors += 1
+            print(f"  [NEW] {prof['name']}: {prof['num_ratings']} ratings")
 
+    print(f"\n  Summary: {new_professors} new, {updated_professors} updated, {up_to_date} up-to-date")
+    print(f"  Total to scrape: {len(professors_to_scrape)}")
     return professors_to_scrape
 
 def scrape_professor_comments(client, supabase, prof, valid_courses):
     """
     Given a professor object, fetch detailed rating information via the RMP API.
     """
-    print(f"Scraping comments for {prof['name']}...")
-    print(prof["url"])
+    print(f"\n  --- {prof['name']} ({prof['url']}) ---")
 
     has_reviews = prof["num_ratings"] > 0
 
@@ -286,6 +319,7 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
     overall_rating = prof_details.overall_rating
     percent_take_again = prof_details.percent_take_again
     level_of_difficulty = prof_details.level_of_difficulty
+    print(f"  Rating: {overall_rating}/5 | Difficulty: {level_of_difficulty}/5 | Would retake: {percent_take_again}%")
 
     if not has_reviews:
         # Still upsert professor metadata even with no reviews
@@ -305,19 +339,23 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
         except APIError as e:
             code = getattr(e, "code", None) or (e.args[0].get("code") if e.args and isinstance(e.args[0], dict) else None)
             if code == "23505":
-                print(f"Skipping professor upsert (duplicate name '{prof['name']}').")
+                print(f"  Skipped professor upsert (duplicate name)")
             else:
                 raise
-        print(f"No reviews found for {prof['name']}")
+        print(f"  No reviews to process")
         return
 
     # --- Fetch ratings via iterator with since filter ---
     since_date = None
     if prof["latest_comment_date"]:
         since_date = date.fromisoformat(prof["latest_comment_date"])
+        print(f"  Fetching ratings since {since_date}...")
+    else:
+        print(f"  Fetching all ratings (new professor)...")
 
     # Collect all ratings first to build course code mappings
     raw_ratings = list(client.iter_professor_ratings(prof["id"], since=since_date))
+    print(f"  API returned {len(raw_ratings)} ratings")
 
     # Build course code mappings from all course labels in ratings
     all_courses = set()
@@ -326,18 +364,34 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
             all_courses.add(rating.course_raw)
     course_code_mappings = clean_and_map_course_codes(all_courses, valid_courses) if all_courses else {}
 
+    mapped_count = sum(1 for v in course_code_mappings.values() if v is not None)
+    unmapped_count = sum(1 for v in course_code_mappings.values() if v is None)
+    if all_courses:
+        print(f"  Course codes found: {all_courses}")
+        print(f"  Mapped: {mapped_count}, Unmapped: {unmapped_count}")
+        for raw, mapped in course_code_mappings.items():
+            if mapped:
+                print(f"    {raw} -> {mapped[0]}")
+            else:
+                print(f"    {raw} -> general_course (no match)")
+
     # Get all of the previous comments from the database
     response = supabase.table("rag_chunks").select("text", "created_at").eq("professor_name", prof["name"]).execute()
     existing_reviews_set = set((r["text"].strip(), r["created_at"]) for r in response.data)
     seen_reviews_set = set()
+    print(f"  Existing reviews in DB: {len(existing_reviews_set)}")
 
     # Collect all unique tags from ratings for professor-level tags
     all_tag_counts = {}
 
     reviews = []
+    skipped_invalid = 0
+    skipped_duplicate = 0
+
     for rating in raw_ratings:
         comment = rating.comment
         if not is_valid_comment(comment):
+            skipped_invalid += 1
             continue
 
         rating_date = rating.date.isoformat()
@@ -355,6 +409,7 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
         # Normalize and deduplicate
         normalized_comment = normalize_comment(comment)
         if (normalized_comment, rating_date) in existing_reviews_set or (normalized_comment, rating_date) in seen_reviews_set:
+            skipped_duplicate += 1
             continue
         seen_reviews_set.add((normalized_comment, rating_date))
 
@@ -380,6 +435,8 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
 
         reviews.append(parsed_review)
 
+    print(f"  Processing: {len(reviews)} new, {skipped_duplicate} duplicates, {skipped_invalid} invalid (too short)")
+
     # Build top tags from aggregated tag counts
     top_tags = sorted(all_tag_counts, key=all_tag_counts.get, reverse=True)[:5]
 
@@ -402,11 +459,12 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
 
     try:
         supabase.table("professors").upsert(updated_prof, on_conflict=["id"]).execute()
+        print(f"  Professor record updated")
     except APIError as e:
         code = getattr(e, "code", None) or (e.args[0].get("code") if e.args and isinstance(e.args[0], dict) else None)
         if code == "23505":
             # Duplicate name (unique_professor_name): same person, different RMP id — skip upsert, still insert comments
-            print(f"Skipping professor upsert (duplicate name '{prof['name']}'), inserting reviews only.")
+            print(f"  Skipped professor upsert (duplicate name), inserting reviews only")
         else:
             raise
 
@@ -437,15 +495,18 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
                 on_conflict="source,source_url,text_hash",
                 ignore_duplicates=True,
             ).execute()
-            print(f"Inserted {len(comment_data_batch)} reviews for {prof['name']}")
+            print(f"  Inserted {len(comment_data_batch)} review rows ({len(reviews)} reviews across {len(set(c['course_code'] for c in comment_data_batch))} courses)")
         except APIError as e:
             api_code = getattr(e, "code", None) or (e.args[0].get("code") if e.args and isinstance(e.args[0], dict) else None)
-            print(f"Could not insert reviews for {prof['name']} (API error {api_code}): {e}. Skipping batch.")
+            print(f"  ERROR: Could not insert reviews (API error {api_code}): {e}")
     else:
-        print(f"No reviews found for {prof['name']}")
+        print(f"  No new reviews to insert")
 
 
 if __name__ == "__main__":
+    total_start = time.time()
+    print(f"RMP Scraper started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
     # Create Supabase client
     supabase = create_supabase_client()
 
@@ -455,21 +516,34 @@ if __name__ == "__main__":
 
         # Get the professors that need to be scraped
         professors_to_scrape = to_scrape_professor(supabase, professors)
-        count_professors_to_scrape = len(professors_to_scrape)
-        print(f"Number of professors to scrape: {count_professors_to_scrape}")
 
-        # Get all of the valid courses from the database
-        valid_courses = get_all_valid_courses(supabase)
+        if not professors_to_scrape:
+            print("\nNo professors need scraping. Everything is up to date.")
+        else:
+            # Get all of the valid courses from the database
+            valid_courses = get_all_valid_courses(supabase)
+            print(f"\nLoaded {len(valid_courses)} valid courses from DB")
 
-        # Iterate through the professors that need to be scraped
-        scraped_count = 0
-        for prof in professors_to_scrape:
-            try:
-                scrape_professor_comments(client, supabase, prof, valid_courses)
-            except Exception as e:
-                print(f"Error scraping {prof.get('name', 'unknown')} ({prof.get('url', '')}): {e}. Continuing with next professor.")
-            scraped_count += 1
-            print(f"Scraped {scraped_count}/{count_professors_to_scrape} professors")
-            time.sleep(1)
+            print(f"\n{'='*60}")
+            print(f"PHASE 3: Scraping reviews for {len(professors_to_scrape)} professors")
+            print(f"{'='*60}")
 
-    print("Scraping complete")
+            # Iterate through the professors that need to be scraped
+            total_new_reviews = 0
+            total_errors = 0
+            for i, prof in enumerate(professors_to_scrape, 1):
+                try:
+                    scrape_professor_comments(client, supabase, prof, valid_courses)
+                except Exception as e:
+                    print(f"  ERROR scraping {prof.get('name', 'unknown')}: {e}")
+                    total_errors += 1
+                print(f"  Progress: {i}/{len(professors_to_scrape)}")
+                time.sleep(1)
+
+            if total_errors:
+                print(f"\n  Errors encountered: {total_errors}")
+
+    total_elapsed = time.time() - total_start
+    print(f"\n{'='*60}")
+    print(f"RMP Scraper complete in {total_elapsed:.1f}s ({total_elapsed/60:.1f}m)")
+    print(f"{'='*60}")
