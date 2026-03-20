@@ -67,7 +67,7 @@ def clean_and_map_course_codes(course_codes, valid_courses):
             continue
 
         # 2. Extract the original prefix + first 3-digit number only
-        prefix_match = re.match(r"^([A-Z]+)(\d{3})", cleaned)
+        prefix_match = re.match(r"^([A-Z]+)[-\s]?(\d{3})", cleaned)
         if prefix_match:
             prefix, num = prefix_match.group(1), prefix_match.group(2)
             candidate = f"{prefix} {num}"
