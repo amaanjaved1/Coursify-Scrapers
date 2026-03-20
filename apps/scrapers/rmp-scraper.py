@@ -137,31 +137,37 @@ def clean_and_map_course_codes(course_codes, valid_courses):
 
 _sentiment_pipeline = pipeline(
     "sentiment-analysis",
-    model="distilbert-base-uncased-finetuned-sst-2-english",
+    model="CoursifyQU/student-review-sentiment",
     device=-1,
 )
 
 
 def detect_sentiment(text):
     """
-    Text-only sentiment using distilbert.
+    Text-only sentiment using fine-tuned RoBERTa model trained on 18K+ Queen's student reviews.
     Returns a (-1..1) score and a human-readable label.
     Quality/difficulty ratings are stored as separate structured fields.
     """
     result = _sentiment_pipeline(text[:2000])[0]
-    raw_label = result["label"]
+    raw_label = result["label"]       # "negative", "neutral", or "positive"
     confidence = result["score"]
 
-    score = confidence if raw_label == "POSITIVE" else -confidence
+    if raw_label == "positive":
+        score = confidence
+    elif raw_label == "negative":
+        score = -confidence
+    else:
+        score = 0.0  # neutral
+
     score = round(score, 4)
 
     if score > 0.85:
         label = "very positive"
-    elif score > 0.5:
+    elif score > 0.3:
         label = "positive"
     elif score < -0.85:
         label = "very negative"
-    elif score < -0.5:
+    elif score < -0.3:
         label = "negative"
     else:
         label = "neutral"

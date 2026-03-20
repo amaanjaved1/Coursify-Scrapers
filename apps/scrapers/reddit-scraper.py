@@ -12,7 +12,7 @@ from transformers import pipeline
 
 _sentiment_pipeline = pipeline(
     "sentiment-analysis",
-    model="distilbert-base-uncased-finetuned-sst-2-english",
+    model="CoursifyQU/student-review-sentiment",
     device=-1,
 )
 
@@ -45,14 +45,20 @@ def setup_reddit():
 
 def detect_sentiment(text, upvotes=1):
     """
-    Composite sentiment: distilbert polarity weighted with a Reddit upvote confidence signal.
+    Composite sentiment: fine-tuned RoBERTa polarity weighted with a Reddit upvote confidence signal.
     upvotes > ~10 amplifies the polarity direction (community agrees), low/negative upvotes dampen it.
     Returns (sentiment_score, sentiment_label).
     """
     result = _sentiment_pipeline(text[:2000])[0]
-    raw_label = result["label"]
+    raw_label = result["label"]       # "negative", "neutral", or "positive"
     confidence = result["score"]
-    polarity = confidence if raw_label == "POSITIVE" else -confidence
+
+    if raw_label == "positive":
+        polarity = confidence
+    elif raw_label == "negative":
+        polarity = -confidence
+    else:
+        polarity = 0.0  # neutral
 
     upvote_signal = math.tanh((upvotes - 1) / 10.0)  # maps ~(-1, 1); 1 upvote -> 0
     # If polarity and upvotes agree in sign, reinforce; otherwise dampen
@@ -65,11 +71,11 @@ def detect_sentiment(text, upvotes=1):
 
     if score > 0.85:
         label = "very positive"
-    elif score > 0.5:
+    elif score > 0.3:
         label = "positive"
     elif score < -0.85:
         label = "very negative"
-    elif score < -0.5:
+    elif score < -0.3:
         label = "negative"
     else:
         label = "neutral"
