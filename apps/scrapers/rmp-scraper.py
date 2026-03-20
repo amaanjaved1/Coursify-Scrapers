@@ -44,94 +44,31 @@ def get_all_valid_courses(supabase):
 
 def clean_and_map_course_codes(course_codes, valid_courses):
     """
-    Refined two-pass system to clean messy scraped course codes.
+    Strict course code mapping: exact match or prefix+number from the original
+    code only. No cross-department guessing.
     """
-
-    # --- Step 1: Build valid dept codes, number codes, and derived clean courses ---
-    valid_dept_codes = set()
-    valid_num_codes = set()
-    derived_valid_courses = set()
-
-    valid_courses_no_space = {course.replace(" ", "").upper(): course for course in valid_courses}
-
-    for raw_code in course_codes:
-        cleaned = raw_code.strip().replace(" ", "").upper()
-
-        # Extract prefix and number parts
-        prefix_match = re.match(r"^[A-Z]+", cleaned)
-        number_parts = re.findall(r"\d+", cleaned)
-
-        if prefix_match:
-            prefix = prefix_match.group(0)
-
-            # Check if prefix matches any valid course
-            for valid in valid_courses:
-                if valid.replace(" ", "").startswith(prefix):
-                    valid_dept_codes.add(prefix)
-                    break
-
-        for num in number_parts:
-            if len(num) >= 3:
-                num = num[:3]
-                # Try matching this number with known prefixes
-                for dept in valid_dept_codes:
-                    candidate = f"{dept} {num}"
-                    if candidate in valid_courses:
-                        valid_num_codes.add(num)
-                        derived_valid_courses.add(candidate)
-
-    # --- Step 2: Build mapping ---
+    valid_courses_no_space = {c.replace(" ", "").upper(): c for c in valid_courses}
     course_mapping = {}
 
     for raw_code in course_codes:
-        matches = []
         cleaned = raw_code.strip().replace(" ", "").upper()
 
-        # Exact match to known valid courses first
+        # 1. Exact match (e.g. "APSC112" -> "APSC 112")
         if cleaned in valid_courses_no_space:
-            matches.append(valid_courses_no_space[cleaned])
+            course_mapping[raw_code] = [valid_courses_no_space[cleaned]]
+            continue
 
-        else:
-            prefix_match = re.match(r"^[A-Z]+", cleaned)
-            number_parts = re.findall(r"\d+", cleaned)
+        # 2. Extract the original prefix + first 3-digit number only
+        prefix_match = re.match(r"^([A-Z]+)(\d{3})", cleaned)
+        if prefix_match:
+            prefix, num = prefix_match.group(1), prefix_match.group(2)
+            candidate = f"{prefix} {num}"
+            if candidate in valid_courses:
+                course_mapping[raw_code] = [candidate]
+                continue
 
-            if prefix_match and number_parts:
-                prefix = prefix_match.group(0)
-                suffix = cleaned[len(prefix):]
-
-                # Try to build full courses
-                idx = 0
-                while idx < len(suffix):
-                    num = suffix[idx:idx+3]
-                    idx += 3
-
-                    for dept in valid_dept_codes:
-                        candidate = f"{dept} {num}"
-                        if candidate in derived_valid_courses:
-                            matches.append(candidate)
-
-            elif cleaned.isdigit() and len(cleaned) == 3:
-                # Just numbers
-                num = cleaned
-                if num in valid_num_codes:
-                    for dept in valid_dept_codes:
-                        candidate = f"{dept} {num}"
-                        if candidate in derived_valid_courses:
-                            matches.append(candidate)
-                else:
-                    matches = None
-
-            elif cleaned.isalpha():
-                # Only letters (ANAT) => ambiguous
-                matches = None
-
-            else:
-                matches = None
-
-        if matches is not None and len(matches) == 1:
-            course_mapping[raw_code] = matches
-        else:
-            course_mapping[raw_code] = None
+        # 3. No match -> general_course
+        course_mapping[raw_code] = None
 
     return course_mapping
 
