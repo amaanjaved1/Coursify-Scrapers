@@ -5,3 +5,4 @@ apps/redis/redis-test.py
 .claude/
 apps/scrapers/__pycache__/
 apps/scrapers/finetune_sentiment.ipynb
+test_sentiment_comparison.py
