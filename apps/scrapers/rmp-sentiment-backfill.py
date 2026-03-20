@@ -31,7 +31,7 @@ def detect_sentiment(text):
     Text-only sentiment using distilbert.
     Returns a (-1..1) score and a human-readable label.
     """
-    result = _sentiment_pipeline(text[:512])[0]
+    result = _sentiment_pipeline(text[:2000])[0]
     raw_label = result["label"]
     confidence = result["score"]
 
