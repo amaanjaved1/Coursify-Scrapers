@@ -148,7 +148,7 @@ def detect_sentiment(text):
     Returns a (-1..1) score and a human-readable label.
     Quality/difficulty ratings are stored as separate structured fields.
     """
-    result = _sentiment_pipeline(text[:2000])[0]
+    result = _sentiment_pipeline(text[:2000], truncation=True, max_length=512)[0]
     raw_label = result["label"]       # "negative", "neutral", or "positive"
     confidence = result["score"]
 

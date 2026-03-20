@@ -31,7 +31,7 @@ def detect_sentiment(text):
     Text-only sentiment using fine-tuned RoBERTa model trained on 18K+ Queen's student reviews.
     Returns a (-1..1) score and a human-readable label.
     """
-    result = _sentiment_pipeline(text[:2000])[0]
+    result = _sentiment_pipeline(text[:2000], truncation=True, max_length=512)[0]
     raw_label = result["label"]       # "negative", "neutral", or "positive"
     confidence = result["score"]
 
