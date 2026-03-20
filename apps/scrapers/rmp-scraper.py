@@ -34,11 +34,19 @@ def is_valid_comment(comment):
 def get_all_valid_courses(supabase):
     """
     Get all valid courses from the database.
+    Paginates to avoid Supabase's default 1000-row limit.
     """
-    # Query the database for all valid courses
-    valid_courses = supabase.table("courses").select("course_code").execute().data
-    # Extract course codes from the result if the course_code is not 'general_course'
-    valid_course_codes = {course["course_code"] for course in valid_courses if course["course_code"] != "general_course"}
+    all_courses = []
+    page_size = 1000
+    offset = 0
+    while True:
+        batch = supabase.table("courses").select("course_code").range(offset, offset + page_size - 1).execute().data
+        all_courses.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+
+    valid_course_codes = {course["course_code"] for course in all_courses if course["course_code"] != "general_course"}
 
     return valid_course_codes
 
