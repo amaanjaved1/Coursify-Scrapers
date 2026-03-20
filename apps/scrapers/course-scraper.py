@@ -20,10 +20,14 @@ def fetch_page(page, url, wait_selector=".courseblock"):
     """
     Navigate to a URL with Playwright and return a BeautifulSoup object.
     Waits for the WAF challenge to resolve and the content to render.
+    Falls back to networkidle if the expected selector never appears.
     """
     page.goto(url, timeout=60000)
     if wait_selector:
-        page.wait_for_selector(wait_selector, timeout=30000)
+        try:
+            page.wait_for_selector(wait_selector, timeout=30000)
+        except Exception:
+            page.wait_for_load_state("networkidle", timeout=15000)
     else:
         page.wait_for_load_state("networkidle", timeout=30000)
     return BeautifulSoup(page.content(), "html.parser")
