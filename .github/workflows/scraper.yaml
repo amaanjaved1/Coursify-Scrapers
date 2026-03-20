@@ -77,11 +77,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r apps/scrapers/requirements.txt
 
-      - name: Set up Chrome for RMP scraper
-        uses: browser-actions/setup-chrome@v1
-        with:
-          chrome-version: "latest"
-
       - name: Run RMP scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}

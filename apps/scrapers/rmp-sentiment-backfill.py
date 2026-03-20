@@ -1,6 +1,6 @@
 """
 One-shot backfill script: recomputes sentiment_score and sentiment_label for all
-existing RMP rag_chunks using the improved composite sentiment function.
+existing RMP rag_chunks using distilbert text-only sentiment.
 
 Safe to run multiple times (idempotent).
 
@@ -11,25 +11,14 @@ import os
 import time
 
 import httpx
+from transformers import pipeline
 from supabase import create_client, Client
-from textblob import TextBlob
 
-# ---------------------------------------------------------------------------
-# Sentiment lookup (mirrors rmp-scraper.py — keep in sync)
-# ---------------------------------------------------------------------------
-RMP_TAG_SENTIMENT = {
-    "Amazing lectures": 0.8, "Inspirational": 0.9, "Respected": 0.7,
-    "Caring": 0.7, "Hilarious": 0.6, "Accessible outside class": 0.6,
-    "Clear grading criteria": 0.5, "Gives good feedback": 0.6,
-    "Would take again": 0.8, "Participation matters": 0.1,
-    "Lecture heavy": 0.0, "Tests? Not many": 0.2, "Extra credit": 0.3,
-    "Graded by few things": -0.1, "Group projects": 0.0,
-    "Online savvy": 0.2, "Beware of pop quizzes": -0.2,
-    "Tough grader": -0.4, "Skip class? You won't pass.": -0.3,
-    "Get ready to read": -0.3, "Lots of homework": -0.4,
-    "Test heavy": -0.3, "So many papers": -0.4,
-    "Would not take again": -0.9,
-}
+_sentiment_pipeline = pipeline(
+    "sentiment-analysis",
+    model="distilbert-base-uncased-finetuned-sst-2-english",
+    device=-1,
+)
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_FILE = os.path.join(SCRIPT_DIR, "backfill_checkpoint.txt")
@@ -37,39 +26,25 @@ MAX_RETRIES = int(os.getenv("RMP_BACKFILL_MAX_RETRIES", "5"))
 PROGRESS_EVERY = int(os.getenv("RMP_BACKFILL_PROGRESS_EVERY", "500"))
 
 
-def detect_sentiment(text, quality_rating=None, difficulty_rating=None, tags=None):
-    blob = TextBlob(text)
-    text_polarity = blob.sentiment.polarity
+def detect_sentiment(text):
+    """
+    Text-only sentiment using distilbert.
+    Returns a (-1..1) score and a human-readable label.
+    """
+    result = _sentiment_pipeline(text[:512])[0]
+    raw_label = result["label"]
+    confidence = result["score"]
 
-    quality_signal = (quality_rating - 3.0) / 2.0 if quality_rating is not None else 0.0
+    score = confidence if raw_label == "POSITIVE" else -confidence
+    score = round(score, 4)
 
-    difficulty_signal = 0.0
-    if difficulty_rating is not None and quality_rating is not None:
-        if difficulty_rating >= 4.0 and quality_rating <= 2.0:
-            difficulty_signal = -0.6
-        elif difficulty_rating >= 4.0 and quality_rating <= 3.0:
-            difficulty_signal = -0.3
-        elif difficulty_rating <= 2.0 and quality_rating >= 4.0:
-            difficulty_signal = 0.4
-        else:
-            difficulty_signal = (3.0 - difficulty_rating) / 5.0
-
-    tag_signal = 0.0
-    if tags:
-        tag_scores = [RMP_TAG_SENTIMENT.get(t, 0.0) for t in tags]
-        if tag_scores:
-            tag_signal = sum(tag_scores) / len(tag_scores)
-
-    score = 0.35 * text_polarity + 0.40 * quality_signal + 0.15 * difficulty_signal + 0.10 * tag_signal
-    score = max(-1.0, min(1.0, round(score, 4)))
-
-    if score > 0.4:
+    if score > 0.85:
         label = "very positive"
-    elif score > 0.15:
+    elif score > 0.5:
         label = "positive"
-    elif score < -0.4:
+    elif score < -0.85:
         label = "very negative"
-    elif score < -0.15:
+    elif score < -0.5:
         label = "negative"
     else:
         label = "neutral"
@@ -120,7 +95,7 @@ def fetch_all_rmp_chunks(supabase):
     while True:
         resp = _execute_with_retry(
             supabase.table("rag_chunks")
-            .select("id, text, quality_rating, difficulty_rating, tags, sentiment_score, sentiment_label")
+            .select("id, text, sentiment_score, sentiment_label")
             .eq("source", "ratemyprofessors")
             .range(offset, offset + page_size - 1),
             action_label=f"fetch rows {offset}-{offset + page_size - 1}",
@@ -156,12 +131,7 @@ def main():
                 skipped_from_checkpoint += 1
                 continue
 
-            new_score, new_label = detect_sentiment(
-                row["text"],
-                quality_rating=row.get("quality_rating"),
-                difficulty_rating=row.get("difficulty_rating"),
-                tags=row.get("tags") or [],
-            )
+            new_score, new_label = detect_sentiment(row["text"])
 
             old_label = row.get("sentiment_label")
             if new_score != row.get("sentiment_score") or new_label != old_label:
