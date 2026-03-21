@@ -34,104 +34,49 @@ def is_valid_comment(comment):
 def get_all_valid_courses(supabase):
     """
     Get all valid courses from the database.
+    Paginates to avoid Supabase's default 1000-row limit.
     """
-    # Query the database for all valid courses
-    valid_courses = supabase.table("courses").select("course_code").execute().data
-    # Extract course codes from the result if the course_code is not 'general_course'
-    valid_course_codes = {course["course_code"] for course in valid_courses if course["course_code"] != "general_course"}
+    all_courses = []
+    page_size = 1000
+    offset = 0
+    while True:
+        batch = supabase.table("courses").select("course_code").range(offset, offset + page_size - 1).execute().data
+        all_courses.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+
+    valid_course_codes = {course["course_code"] for course in all_courses if course["course_code"] != "general_course"}
 
     return valid_course_codes
 
 def clean_and_map_course_codes(course_codes, valid_courses):
     """
-    Refined two-pass system to clean messy scraped course codes.
+    Strict course code mapping: exact match or prefix+number from the original
+    code only. No cross-department guessing.
     """
-
-    # --- Step 1: Build valid dept codes, number codes, and derived clean courses ---
-    valid_dept_codes = set()
-    valid_num_codes = set()
-    derived_valid_courses = set()
-
-    valid_courses_no_space = {course.replace(" ", "").upper(): course for course in valid_courses}
-
-    for raw_code in course_codes:
-        cleaned = raw_code.strip().replace(" ", "").upper()
-
-        # Extract prefix and number parts
-        prefix_match = re.match(r"^[A-Z]+", cleaned)
-        number_parts = re.findall(r"\d+", cleaned)
-
-        if prefix_match:
-            prefix = prefix_match.group(0)
-
-            # Check if prefix matches any valid course
-            for valid in valid_courses:
-                if valid.replace(" ", "").startswith(prefix):
-                    valid_dept_codes.add(prefix)
-                    break
-
-        for num in number_parts:
-            if len(num) >= 3:
-                num = num[:3]
-                # Try matching this number with known prefixes
-                for dept in valid_dept_codes:
-                    candidate = f"{dept} {num}"
-                    if candidate in valid_courses:
-                        valid_num_codes.add(num)
-                        derived_valid_courses.add(candidate)
-
-    # --- Step 2: Build mapping ---
+    valid_courses_no_space = {c.replace(" ", "").upper(): c for c in valid_courses}
     course_mapping = {}
 
     for raw_code in course_codes:
-        matches = []
         cleaned = raw_code.strip().replace(" ", "").upper()
 
-        # Exact match to known valid courses first
+        # 1. Exact match (e.g. "APSC112" -> "APSC 112")
         if cleaned in valid_courses_no_space:
-            matches.append(valid_courses_no_space[cleaned])
+            course_mapping[raw_code] = [valid_courses_no_space[cleaned]]
+            continue
 
-        else:
-            prefix_match = re.match(r"^[A-Z]+", cleaned)
-            number_parts = re.findall(r"\d+", cleaned)
+        # 2. Extract the original prefix + first 3-digit number only
+        prefix_match = re.match(r"^([A-Z]+)[-\s]?(\d{3})", cleaned)
+        if prefix_match:
+            prefix, num = prefix_match.group(1), prefix_match.group(2)
+            candidate = f"{prefix} {num}"
+            if candidate in valid_courses:
+                course_mapping[raw_code] = [candidate]
+                continue
 
-            if prefix_match and number_parts:
-                prefix = prefix_match.group(0)
-                suffix = cleaned[len(prefix):]
-
-                # Try to build full courses
-                idx = 0
-                while idx < len(suffix):
-                    num = suffix[idx:idx+3]
-                    idx += 3
-
-                    for dept in valid_dept_codes:
-                        candidate = f"{dept} {num}"
-                        if candidate in derived_valid_courses:
-                            matches.append(candidate)
-
-            elif cleaned.isdigit() and len(cleaned) == 3:
-                # Just numbers
-                num = cleaned
-                if num in valid_num_codes:
-                    for dept in valid_dept_codes:
-                        candidate = f"{dept} {num}"
-                        if candidate in derived_valid_courses:
-                            matches.append(candidate)
-                else:
-                    matches = None
-
-            elif cleaned.isalpha():
-                # Only letters (ANAT) => ambiguous
-                matches = None
-
-            else:
-                matches = None
-
-        if matches is not None and len(matches) == 1:
-            course_mapping[raw_code] = matches
-        else:
-            course_mapping[raw_code] = None
+        # 3. No match -> general_course
+        course_mapping[raw_code] = None
 
     return course_mapping
 
@@ -148,7 +93,7 @@ def detect_sentiment(text):
     Returns a (-1..1) score and a human-readable label.
     Quality/difficulty ratings are stored as separate structured fields.
     """
-    result = _sentiment_pipeline(text[:2000])[0]
+    result = _sentiment_pipeline(text[:2000], truncation=True, max_length=512)[0]
     raw_label = result["label"]       # "negative", "neutral", or "positive"
     confidence = result["score"]
 

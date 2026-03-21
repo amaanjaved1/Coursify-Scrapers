@@ -1,7 +1,6 @@
 import os
 from supabase import create_client, Client
-import requests
-from requests import get
+from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import pandas as pd
 import numpy as np
@@ -17,11 +16,62 @@ def create_supabase_client():
     return supabase
 
 
+def fetch_page(page, url, wait_selector=".courseblock"):
+    """
+    Navigate to a URL with Playwright and return a BeautifulSoup object.
+    Waits for the WAF challenge to resolve and the content to render.
+    Falls back to networkidle if the expected selector never appears.
+    """
+    page.goto(url, timeout=60000)
+    if wait_selector:
+        try:
+            page.wait_for_selector(wait_selector, timeout=30000)
+        except Exception:
+            page.wait_for_load_state("networkidle", timeout=15000)
+    else:
+        page.wait_for_load_state("networkidle", timeout=30000)
+    return BeautifulSoup(page.content(), "html.parser")
+
+
+def extract_courses_from_soup(soup):
+    """
+    Extract course data from a BeautifulSoup object containing .courseblock elements.
+    Returns a list of dicts.
+    """
+    rows = []
+    courses = soup.find_all("div", class_="courseblock")
+    for course in courses:
+        code_el = course.find("span", class_="detail-code")
+        name_el = course.find("span", class_="detail-title")
+        units_el = course.find("span", class_="detail-hours_html")
+        if not code_el or not name_el or not units_el:
+            continue
+
+        learning_outcomes = []
+        outcomes_section = course.find("span", class_="detail-cim_los")
+        if outcomes_section:
+            for li in outcomes_section.find_all("li"):
+                learning_outcomes.append(li.get_text(strip=True))
+
+        rows.append({
+            "course_code": code_el.get_text(strip=True),
+            "course_name": name_el.get_text(strip=True),
+            "course_units": units_el.get_text(strip=True).replace("Units: ", ""),
+            "course_description": course.find("div", class_="courseblockextra").get_text(strip=True) if course.find("div", class_="courseblockextra") else None,
+            "course_requirements": course.find("span", class_="detail-requirements").get_text(strip=True).replace("Requirements: ", "") if course.find("span", class_="detail-requirements") else None,
+            "learning_hours": course.find("span", class_="detail-learning_hours").get_text(strip=True).replace("Learning Hours: ", "") if course.find("span", class_="detail-learning_hours") else None,
+            "course_equivalencies": course.find("span", class_="detail-course_equivalencies").get_text(strip=True).replace("Course Equivalencies: ", "") if course.find("span", class_="detail-course_equivalencies") else None,
+            "offering_faculty": course.find("span", class_="detail-offering_faculty").get_text(strip=True).replace("Offering Faculty: ", "") if course.find("span", class_="detail-offering_faculty") else None,
+            "course_learning_outcomes": learning_outcomes,
+        })
+    return rows
+
 
 def scrape_all_course():
     """
-    Scrape course data from Queen's University website and store it in Supabase."""
-    headers = { "Accept-Language": "en-US,en;q=0.9,en-GB;q=0.8,en-CA;q=0.7" }
+    Scrape course data from Queen's University website and store it in Supabase.
+    Uses Playwright to render JS-heavy pages.
+    """
     art_sci_url = "https://www.queensu.ca/academic-calendar/arts-science/course-descriptions/"
     education_url = "https://www.queensu.ca/academic-calendar/education/course-descriptions/"
     health_sci_url = "https://www.queensu.ca/academic-calendar/health-sciences/bhsc/courses-instruction/"
@@ -42,339 +92,102 @@ def scrape_all_course():
         "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/mntc/",
         "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/soft/",
     ]
-
     commerce_url = "https://www.queensu.ca/academic-calendar/business/bachelor-commerce/courses-of-instruction/by20number/#onezerozeroleveltext"
-    
-    # Create a pandas DataFrame to store the scraped data
-    columns = [
-        "course_code",
-        "course_name",
-        "course_description",
-        "offering_faculty",
-        "learning_hours",
-        "course_learning_outcomes",
-        "course_requirements",
-        "course_equivalencies"
-    ]
-    course_data = pd.DataFrame(columns=columns)
-    
-    # Faculty 1: Arts & Science
-    print("Scraping Arts & Science courses...")
-    
-    # Step 1: Get the main URL content
-    results = requests.get(art_sci_url, headers=headers)
-    art_sci_main_url_content = BeautifulSoup(results.content, "html.parser")
 
-    # Step 2: Find the embedded links for the course offerings page for each department within the faculty
-    art_sci_main_url_content_container = art_sci_main_url_content.find("ul", {"id": "/arts-science/course-descriptions/"})  # get the container element
+    all_rows = []
 
-    if art_sci_main_url_content_container is not None:
-        art_sci_dept_course_pages = art_sci_main_url_content_container.find_all("a")  # get all the links in the container
-    else:
-        # Fallback: department links are /academic-calendar/arts-science/course-descriptions/<dept>/ (one segment after course-descriptions/)
-        def _is_dept_href(h):
-            if not h or "arts-science/course-descriptions/" not in h or "crse-mode" in h:
-                return False
-            parts = h.replace("https://www.queensu.ca", "").strip("/").split("/")
-            try:
-                i = parts.index("course-descriptions")
-                return len(parts) > i + 1 and (len(parts) == i + 2 or (len(parts) == i + 3 and parts[-1] == ""))
-            except ValueError:
-                return False
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
+        page = context.new_page()
 
-        art_sci_dept_course_pages = [a for a in art_sci_main_url_content.select('a[href*="arts-science/course-descriptions/"]') if _is_dept_href(a.get("href"))]
+        # Faculty 1: Arts & Science
+        print("Scraping Arts & Science courses...")
+        soup = fetch_page(page, art_sci_url, wait_selector='a[href*="arts-science/course-descriptions/"]')
 
-    # Step 3: For each department, go through the courses offered and scrape the data
-    for dept_course_page in art_sci_dept_course_pages:
+        # Find department links
+        container = soup.find("ul", {"id": "/arts-science/course-descriptions/"})
+        if container is not None:
+            dept_links = container.find_all("a")
+        else:
+            def _is_dept_href(h):
+                if not h or "arts-science/course-descriptions/" not in h or "crse-mode" in h:
+                    return False
+                parts = h.replace("https://www.queensu.ca", "").strip("/").split("/")
+                try:
+                    i = parts.index("course-descriptions")
+                    return len(parts) > i + 1 and (len(parts) == i + 2 or (len(parts) == i + 3 and parts[-1] == ""))
+                except ValueError:
+                    return False
+            dept_links = [a for a in soup.select('a[href*="arts-science/course-descriptions/"]') if _is_dept_href(a.get("href"))]
 
-        # Get the URL and name of the department course page
-        dept_course_page_url = dept_course_page.get("href")
-        dept_course_page_name = dept_course_page.get_text(strip=True)
-        _req_url = dept_course_page_url if (dept_course_page_url or "").startswith("http") else "https://www.queensu.ca" + ((dept_course_page_url or "") if (dept_course_page_url or "").startswith("/") else "/" + (dept_course_page_url or ""))
+        for dept_link in dept_links:
+            dept_url = dept_link.get("href")
+            dept_name = dept_link.get_text(strip=True)
+            if not dept_url:
+                continue
+            if not dept_url.startswith("http"):
+                dept_url = "https://www.queensu.ca" + (dept_url if dept_url.startswith("/") else "/" + dept_url)
 
-        print(f"Scraping {dept_course_page_name} courses...")
+            dept_soup = fetch_page(page, dept_url)
+            rows = extract_courses_from_soup(dept_soup)
+            all_rows.extend(rows)
+            print(f"  {dept_name}: {len(rows)} courses")
 
-        # Make a request to the department course page
-        dept_course_page_results = requests.get(_req_url, headers=headers)
-        dept_course_page_content = BeautifulSoup(dept_course_page_results.content, "html.parser")
-        
-        # Get each course from the department course page
-        courses = dept_course_page_content.find_all("div", class_="courseblock")
-        for course in courses:
-            course_code = course.find("span", class_="detail-code").get_text(strip=True)
-            course_name = course.find("span", class_="detail-title").get_text(strip=True)
-            course_units = course.find("span", class_="detail-hours_html").get_text(strip=True).replace("Units: ", "")
-            course_description = course.find("div", class_="courseblockextra").get_text(strip=True) if course.find("div", class_="courseblockextra") else None
-            course_requirements = course.find("span", class_="detail-requirements").get_text(strip=True).replace("Requirements: ", "") if course.find("span", class_="detail-requirements") else None
-            course_learning_hours = course.find("span", class_="detail-learning_hours").get_text(strip=True).replace("Learning Hours: ", "") if course.find("span", class_="detail-learning_hours") else None
-            course_equivalencies = course.find("span", class_="detail-course_equivalencies").get_text(strip=True).replace("Course Equivalencies: ", "") if course.find("span", class_="detail-course_equivalencies") else None
-            offering_faculty = course.find("span", class_="detail-offering_faculty").get_text(strip=True).replace("Offering Faculty: ", "") if course.find("span", class_="detail-offering_faculty") else None
+        print(f"✔ Arts & Science: {len(all_rows)} courses total")
 
-            learning_outcomes = []
-            outcomes_section = course.find("span", class_="detail-cim_los")
-            if outcomes_section:
-                outcomes_list = outcomes_section.find_all("li")
-                for outcome in outcomes_list:
-                    learning_outcomes.append(outcome.get_text(strip=True))
+        # Faculty 2: Education
+        print("Scraping Education courses...")
+        soup = fetch_page(page, education_url)
+        rows = extract_courses_from_soup(soup)
+        all_rows.extend(rows)
+        print(f"✔ Education: {len(rows)} courses")
 
-            # Append the course data to the DataFrame
-            course_data = pd.concat([
-            course_data,
-            pd.DataFrame([{
-                "course_code": course_code,
-                "course_name": course_name,
-                "course_description": course_description,
-                "offering_faculty": offering_faculty,
-                "learning_hours": course_learning_hours,
-                "course_learning_outcomes": learning_outcomes,
-                "course_requirements": course_requirements,
-                "course_equivalencies": course_equivalencies,
-                "course_units": course_units
-            }])
-            ], ignore_index=True)
+        # Faculty 3: Health Sciences
+        print("Scraping Health Sciences courses...")
+        soup = fetch_page(page, health_sci_url)
+        rows = extract_courses_from_soup(soup)
+        all_rows.extend(rows)
+        print(f"✔ Health Sciences: {len(rows)} courses")
 
-    # Print success message
-    print("✔ Successfully scraped Arts & Science courses!")
+        # Faculty 4: Nursing
+        print("Scraping Nursing courses...")
+        soup = fetch_page(page, nursing_url)
+        rows = extract_courses_from_soup(soup)
+        all_rows.extend(rows)
+        print(f"✔ Nursing: {len(rows)} courses")
 
-    # Step 4: Repeat the process for other faculties
-    
-    # Faculty 2: Education
-    print("Scraping Education courses...")
+        # Faculty 5: Engineering
+        print("Scraping Engineering courses...")
+        eng_total = 0
+        for engineering_url in engineering_urls:
+            soup = fetch_page(page, engineering_url)
+            rows = extract_courses_from_soup(soup)
+            all_rows.extend(rows)
+            dept = engineering_url.rstrip("/").split("/")[-1].upper()
+            print(f"  {dept}: {len(rows)} courses")
+            eng_total += len(rows)
+        print(f"✔ Engineering: {eng_total} courses total")
 
-    # Step 1: Get the main URL content
-    results = requests.get(education_url, headers=headers)
-    education_main_url_content = BeautifulSoup(results.content, "html.parser")
+        # Faculty 6: Commerce
+        print("Scraping Commerce courses...")
+        soup = fetch_page(page, commerce_url)
+        rows = extract_courses_from_soup(soup)
+        all_rows.extend(rows)
+        print(f"✔ Commerce: {len(rows)} courses")
 
-    # Step 2: Find all course blocks
-    course_blocks = education_main_url_content.find_all("div", class_="courseblock")
+        browser.close()
 
-    # Step 3: Extract course details
-    for course in course_blocks:
-        course_code = course.find("span", class_="detail-code").get_text(strip=True)
-        course_name = course.find("span", class_="detail-title").get_text(strip=True)
-        course_units = course.find("span", class_="detail-hours_html").get_text(strip=True).replace("Units: ", "")
-        course_description = course.find("div", class_="courseblockextra").get_text(strip=True) if course.find("div", class_="courseblockextra") else None
-        course_requirements = course.find("span", class_="detail-requirements").get_text(strip=True).replace("Requirements: ", "") if course.find("span", class_="detail-requirements") else None
-        course_learning_hours = course.find("span", class_="detail-learning_hours").get_text(strip=True).replace("Learning Hours: ", "") if course.find("span", class_="detail-learning_hours") else None
-        course_equivalencies = course.find("span", class_="detail-course_equivalencies").get_text(strip=True).replace("Course Equivalencies: ", "") if course.find("span", class_="detail-course_equivalencies") else None
-        offering_faculty = course.find("span", class_="detail-offering_faculty").get_text(strip=True).replace("Offering Faculty: ", "") if course.find("span", class_="detail-offering_faculty") else None
-
-        learning_outcomes = []
-        outcomes_section = course.find("span", class_="detail-cim_los")
-        if outcomes_section:
-            outcomes_list = outcomes_section.find_all("li")
-            for outcome in outcomes_list:
-                learning_outcomes.append(outcome.get_text(strip=True))
-
-        # Append the course data to the DataFrame
-        course_data = pd.concat([
-            course_data,
-            pd.DataFrame([{
-                "course_code": course_code,
-                "course_name": course_name,
-                "course_description": course_description,
-                "offering_faculty": offering_faculty,
-                "learning_hours": course_learning_hours,
-                "course_learning_outcomes": learning_outcomes,
-                "course_requirements": course_requirements,
-                "course_equivalencies": course_equivalencies,
-                "course_units": course_units
-            }])
-        ], ignore_index=True)
-
-    # Print success message
-    print("✔ Successfully scraped Education courses!")
-
-    # Faculty 3: Health Sciences
-    print("Scraping Health Sciences courses...")
-    results = requests.get(health_sci_url, headers=headers)
-    health_sci_main_url_content = BeautifulSoup(results.content, "html.parser")
-
-    # Step 1: Find all course blocks
-    course_blocks = health_sci_main_url_content.find_all("div", class_="courseblock")
-
-    # Step 2: Extract course details
-    for course in course_blocks:
-        course_code = course.find("span", class_="detail-code").get_text(strip=True)
-        course_name = course.find("span", class_="detail-title").get_text(strip=True)
-        course_units = course.find("span", class_="detail-hours_html").get_text(strip=True).replace("Units: ", "")
-        course_description = course.find("div", class_="courseblockextra").get_text(strip=True) if course.find("div", class_="courseblockextra") else None
-        course_requirements = course.find("span", class_="detail-requirements").get_text(strip=True).replace("Requirements: ", "") if course.find("span", class_="detail-requirements") else None
-        course_learning_hours = course.find("span", class_="detail-learning_hours").get_text(strip=True).replace("Learning Hours: ", "") if course.find("span", class_="detail-learning_hours") else None
-        course_equivalencies = course.find("span", class_="detail-course_equivalencies").get_text(strip=True).replace("Course Equivalencies: ", "") if course.find("span", class_="detail-course_equivalencies") else None
-        offering_faculty = course.find("span", class_="detail-offering_faculty").get_text(strip=True).replace("Offering Faculty: ", "") if course.find("span", class_="detail-offering_faculty") else None
-
-        learning_outcomes = []
-        outcomes_section = course.find("span", class_="detail-cim_los")
-        if outcomes_section:
-            outcomes_list = outcomes_section.find_all("li")
-            for outcome in outcomes_list:
-                learning_outcomes.append(outcome.get_text(strip=True))
-
-        # Append the course data to the DataFrame
-        course_data = pd.concat([
-            course_data,
-            pd.DataFrame([{
-                "course_code": course_code,
-                "course_name": course_name,
-                "course_description": course_description,
-                "offering_faculty": offering_faculty,
-                "learning_hours": course_learning_hours,
-                "course_learning_outcomes": learning_outcomes,
-                "course_requirements": course_requirements,
-                "course_equivalencies": course_equivalencies,
-                "course_units": course_units
-            }])
-        ], ignore_index=True)
-
-    # Print success message
-    print("✔ Successfully scraped Health Sciences courses!")
-
-    # Faculty 4: Nursing
-    print("Scraping Nursing courses...")
-    results = requests.get(nursing_url, headers=headers)
-    nursing_main_url_content = BeautifulSoup(results.content, "html.parser")
-
-    # Step 1: Find all course blocks
-    course_blocks = nursing_main_url_content.find_all("div", class_="courseblock")
-
-    # Step 2: Extract course details
-    for course in course_blocks:
-        course_code = course.find("span", class_="detail-code").get_text(strip=True)
-        course_name = course.find("span", class_="detail-title").get_text(strip=True)
-        course_units = course.find("span", class_="detail-hours_html").get_text(strip=True).replace("Units: ", "")
-        course_description = course.find("div", class_="courseblockextra").get_text(strip=True) if course.find("div", class_="courseblockextra") else None
-        course_requirements = course.find("span", class_="detail-requirements").get_text(strip=True).replace("Requirements: ", "") if course.find("span", class_="detail-requirements") else None
-        course_learning_hours = None  # Not available in the provided structure
-        course_equivalencies = course.find("span", class_="detail-course_equivalencies").get_text(strip=True).replace("Course Equivalencies: ", "") if course.find("span", class_="detail-course_equivalencies") else None
-        offering_faculty = course.find("span", class_="detail-offering_faculty").get_text(strip=True).replace("Offering Faculty: ", "") if course.find("span", class_="detail-offering_faculty") else None
-
-        learning_outcomes = []
-        outcomes_section = course.find("span", class_="detail-cim_los")
-        if outcomes_section:
-            outcomes_list = outcomes_section.find_all("li")
-            for outcome in outcomes_list:
-                learning_outcomes.append(outcome.get_text(strip=True))
-
-        # Append the course data to the DataFrame
-        course_data = pd.concat([
-            course_data,
-            pd.DataFrame([{
-                "course_code": course_code,
-                "course_name": course_name,
-                "course_description": course_description,
-                "offering_faculty": offering_faculty,
-                "learning_hours": course_learning_hours,
-                "course_learning_outcomes": learning_outcomes,
-                "course_requirements": course_requirements,
-                "course_equivalencies": course_equivalencies,
-                "course_units": course_units
-            }])
-        ], ignore_index=True)
-
-    # Print success message
-    print("✔ Successfully scraped Nursing courses!")
-
-    # Faculty 5: Engineering
-    print("Scraping Engineering courses...")
-
-    for engineering_url in engineering_urls:
-        # Make a request to the engineering URL
-        results = requests.get(engineering_url, headers=headers)
-        engineering_main_url_content = BeautifulSoup(results.content, "html.parser")
-
-        # Find all course blocks
-        course_blocks = engineering_main_url_content.find_all("div", class_="courseblock")
-
-        # Extract course details
-        for course in course_blocks:
-            course_code = course.find("span", class_="detail-code").get_text(strip=True)
-            course_name = course.find("span", class_="detail-title").get_text(strip=True)
-            course_units = course.find("span", class_="detail-hours_html").get_text(strip=True).replace("Units: ", "")
-            course_description = course.find("div", class_="courseblockextra").get_text(strip=True) if course.find("div", class_="courseblockextra") else None
-            course_requirements = course.find("span", class_="detail-requirements").get_text(strip=True).replace("Requirements: ", "") if course.find("span", class_="detail-requirements") else None
-            course_learning_hours = None  # Not available in the provided structure
-            course_equivalencies = course.find("span", class_="detail-course_equivalencies").get_text(strip=True).replace("Course Equivalencies: ", "") if course.find("span", class_="detail-course_equivalencies") else None
-            offering_faculty = course.find("span", class_="detail-offering_faculty").get_text(strip=True).replace("Offering Faculty: ", "") if course.find("span", class_="detail-offering_faculty") else None
-
-            learning_outcomes = []
-            outcomes_section = course.find("span", class_="detail-cim_los")
-            if outcomes_section:
-                outcomes_list = outcomes_section.find_all("li")
-                for outcome in outcomes_list:
-                    learning_outcomes.append(outcome.get_text(strip=True))
-
-            # Append the course data to the DataFrame
-            course_data = pd.concat([
-                course_data,
-                pd.DataFrame([{
-                    "course_code": course_code,
-                    "course_name": course_name,
-                    "course_description": course_description,
-                    "offering_faculty": offering_faculty,
-                    "learning_hours": course_learning_hours,
-                    "course_learning_outcomes": learning_outcomes,
-                    "course_requirements": course_requirements,
-                    "course_equivalencies": course_equivalencies,
-                    "course_units": course_units
-                }])
-            ], ignore_index=True)
-
-        print(f"✔ Successfully scraped courses from {engineering_url}")
-
-    # Faculty 6: Commerce
-    print("Scraping Commerce courses...")
-
-    # Make a request to the Commerce URL
-    response = requests.get(commerce_url, headers=headers)
-    soup = BeautifulSoup(response.content, "html.parser")
-
-    # Find all course blocks
-    course_blocks = soup.find_all("div", class_="courseblock")
-
-    # Extract course details
-    for course in course_blocks:
-        course_code = course.find("span", class_="detail-code").get_text(strip=True)
-        course_name = course.find("span", class_="detail-title").get_text(strip=True)
-        course_units = course.find("span", class_="detail-hours_html").get_text(strip=True).replace("Units: ", "")
-        course_description = course.find("div", class_="courseblockextra").get_text(strip=True) if course.find("div", class_="courseblockextra") else None
-        course_requirements = course.find("span", class_="detail-requirements").get_text(strip=True).replace("Requirements: ", "") if course.find("span", class_="detail-requirements") else None
-        course_equivalencies = course.find("span", class_="detail-course_equivalencies").get_text(strip=True).replace("Course Equivalencies: ", "") if course.find("span", class_="detail-course_equivalencies") else None
-        offering_faculty = course.find("span", class_="detail-offering_faculty").get_text(strip=True).replace("Offering Faculty: ", "") if course.find("span", class_="detail-offering_faculty") else None
-
-        learning_outcomes = []
-        outcomes_section = course.find("span", class_="detail-cim_los")
-        if outcomes_section:
-            outcomes_list = outcomes_section.find_all("li")
-            for outcome in outcomes_list:
-                learning_outcomes.append(outcome.get_text(strip=True))
-
-        # Append the course data to the DataFrame
-        course_data = pd.concat([
-            course_data,
-            pd.DataFrame([{
-                "course_code": course_code,
-                "course_name": course_name,
-                "course_description": course_description,
-                "offering_faculty": offering_faculty,
-                "learning_hours": None,  # Not available in this structure
-                "course_learning_outcomes": learning_outcomes,
-                "course_requirements": course_requirements,
-                "course_equivalencies": course_equivalencies,
-                "course_units": course_units
-            }])
-        ], ignore_index=True)
-
-    # Print success message
-    print("✔ Successfully scraped Commerce courses!")
+    course_data = pd.DataFrame(all_rows)
 
     # Drop duplicates
     course_data.drop_duplicates(subset=["course_code"], inplace=True)
 
     # Clean the dataframe
     course_data.replace({np.nan: None, float("inf"): None, float("-inf"): None}, inplace=True)
-    
-    # Print hte number of rows in the DataFrame
+
     print(f"Total number of courses scraped: {len(course_data)}")
 
     return course_data
@@ -433,10 +246,10 @@ def upsert_course_data_to_supabase(supabase, course_data, batch_size=50):
 if __name__ == "__main__":
     # Create Supabase client
     supabase = create_supabase_client()
-    
+
     # Scrape course data
     course_data = scrape_all_course()
-    
+
     # Check for new courses and add them to Supabase
     upsert_course_data_to_supabase(supabase, course_data)
 

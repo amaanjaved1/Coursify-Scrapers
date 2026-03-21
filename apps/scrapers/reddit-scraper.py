@@ -49,7 +49,7 @@ def detect_sentiment(text, upvotes=1):
     upvotes > ~10 amplifies the polarity direction (community agrees), low/negative upvotes dampen it.
     Returns (sentiment_score, sentiment_label).
     """
-    result = _sentiment_pipeline(text[:2000])[0]
+    result = _sentiment_pipeline(text[:2000], truncation=True, max_length=512)[0]
     raw_label = result["label"]       # "negative", "neutral", or "positive"
     confidence = result["score"]
 
