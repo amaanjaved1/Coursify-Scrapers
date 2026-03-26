@@ -8,6 +8,56 @@ import pandas as pd
 import numpy as np
 
 
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_log_codes() -> set[str]:
+    raw = os.getenv("COURSE_SCRAPER_LOG_CODES", "")
+    codes = {part.strip() for part in raw.split(",") if part.strip()}
+    return codes
+
+
+def _format_log_value(value, full_text: bool, truncate_len: int = 400) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, list):
+        return f"list(len={len(value)})"
+    text = str(value)
+    if full_text or len(text) <= truncate_len:
+        return text
+    return f"{text[:truncate_len]}... (len={len(text)})"
+
+
+def _should_log_course(course_code: str, log_rows: bool, log_codes: set[str]) -> bool:
+    if log_rows:
+        return True
+    return bool(log_codes) and course_code in log_codes
+
+
+def _log_course_row(prefix: str, row_data: dict, full_text: bool) -> None:
+    print(f"{prefix} {row_data.get('course_code')} | {row_data.get('course_name')}")
+    print(f"  course_units: {_format_log_value(row_data.get('course_units'), full_text)}")
+    print(
+        f"  course_description: {_format_log_value(row_data.get('course_description'), full_text)}"
+    )
+    print(
+        f"  course_requirements: {_format_log_value(row_data.get('course_requirements'), full_text)}"
+    )
+    print(f"  learning_hours: {_format_log_value(row_data.get('learning_hours'), full_text)}")
+    print(
+        f"  course_equivalencies: {_format_log_value(row_data.get('course_equivalencies'), full_text)}"
+    )
+    print(
+        f"  offering_faculty: {_format_log_value(row_data.get('offering_faculty'), full_text)}"
+    )
+    outcomes = row_data.get("course_learning_outcomes") or []
+    print(f"  course_learning_outcomes_count: {len(outcomes)}")
+
+
 def _fix_sentence_spacing(text: str) -> str:
     """
     Insert a space after . ! ? when the next character is a letter and HTML/text
@@ -344,6 +394,42 @@ def scrape_all_course():
 
     print(f"Total number of courses scraped: {len(course_data)}")
 
+    # Always-on summary so CI logs show whether key fields are being captured.
+    summary_fields = [
+        "course_units",
+        "course_description",
+        "course_requirements",
+        "learning_hours",
+        "course_equivalencies",
+        "offering_faculty",
+    ]
+    print("Field coverage summary:")
+    for field in summary_fields:
+        non_null = int(course_data[field].notna().sum()) if field in course_data else 0
+        null_count = len(course_data) - non_null
+        print(f"  {field}: non_null={non_null} null={null_count}")
+    if "course_learning_outcomes" in course_data:
+        lo_counts = course_data["course_learning_outcomes"].apply(
+            lambda x: len(x) if isinstance(x, list) else 0
+        )
+        print(
+            "  course_learning_outcomes: "
+            f"rows_with_any={int((lo_counts > 0).sum())} "
+            f"max_per_course={int(lo_counts.max() if len(lo_counts) else 0)}"
+        )
+
+    log_rows = _env_flag("COURSE_SCRAPER_LOG_ROWS", False)
+    log_codes = _parse_log_codes()
+    full_text = _env_flag("COURSE_SCRAPER_LOG_FULL_TEXT", False)
+    if log_rows or log_codes:
+        print(
+            "Detailed scrape logging enabled "
+            f"(log_rows={log_rows}, codes={len(log_codes)}, full_text={full_text})"
+        )
+        for row_data in course_data.to_dict("records"):
+            if _should_log_course(row_data.get("course_code", ""), log_rows, log_codes):
+                _log_course_row("[SCRAPED]", row_data, full_text)
+
     return course_data
 
 def upsert_course_data_to_supabase(supabase, course_data, batch_size=50):
@@ -363,6 +449,13 @@ def upsert_course_data_to_supabase(supabase, course_data, batch_size=50):
     }
 
     upsert_payload = []
+    log_rows = _env_flag("COURSE_SCRAPER_LOG_ROWS", False)
+    log_codes = _parse_log_codes()
+    full_text = _env_flag("COURSE_SCRAPER_LOG_FULL_TEXT", False)
+    log_upsert = _env_flag("COURSE_SCRAPER_LOG_UPSERT", False)
+    total_rows = len(course_data)
+    total_batches = (total_rows + batch_size - 1) // batch_size if total_rows else 0
+    batch_number = 0
 
     for index, row in course_data.iterrows():
         course_code = row["course_code"]
@@ -390,8 +483,29 @@ def upsert_course_data_to_supabase(supabase, course_data, batch_size=50):
 
         # If batch size reached or last row, send to Supabase
         if len(upsert_payload) == batch_size or index == len(course_data) - 1:
-            supabase.table("courses").upsert(upsert_payload, on_conflict=["course_code"]).execute()
-            print(f"✅ Upserted {len(upsert_payload)} courses")
+            batch_number += 1
+            if log_upsert:
+                codes = [item["course_code"] for item in upsert_payload]
+                print(
+                    f"Upsert batch {batch_number}/{total_batches}: "
+                    f"{len(upsert_payload)} courses | codes={', '.join(codes)}"
+                )
+            if log_rows or log_codes:
+                for item in upsert_payload:
+                    if _should_log_course(item.get("course_code", ""), log_rows, log_codes):
+                        _log_course_row("[UPSERT]", item, full_text)
+            try:
+                supabase.table("courses").upsert(upsert_payload, on_conflict=["course_code"]).execute()
+            except Exception as exc:
+                failed_codes = ", ".join(item["course_code"] for item in upsert_payload)
+                print(
+                    f"❌ Upsert failed for batch {batch_number}/{total_batches} "
+                    f"(codes: {failed_codes})"
+                )
+                raise RuntimeError(
+                    f"Supabase upsert failed for codes: {failed_codes}"
+                ) from exc
+            print(f"✅ Upserted {len(upsert_payload)} courses (batch {batch_number}/{total_batches})")
             upsert_payload.clear()
 
     print("✔ Successfully batch upserted all course data into Supabase!")
