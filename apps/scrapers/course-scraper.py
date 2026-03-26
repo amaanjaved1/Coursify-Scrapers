@@ -1,9 +1,150 @@
 import os
+import re
+from typing import Optional
 from supabase import create_client, Client
 from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 import pandas as pd
 import numpy as np
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _parse_log_codes() -> set[str]:
+    raw = os.getenv("COURSE_SCRAPER_LOG_CODES", "")
+    codes = {part.strip() for part in raw.split(",") if part.strip()}
+    return codes
+
+
+def _format_log_value(value, full_text: bool, truncate_len: int = 400) -> str:
+    if value is None:
+        return "None"
+    if isinstance(value, list):
+        return f"list(len={len(value)})"
+    text = str(value)
+    if full_text or len(text) <= truncate_len:
+        return text
+    return f"{text[:truncate_len]}... (len={len(text)})"
+
+
+def _should_log_course(course_code: str, log_rows: bool, log_codes: set[str]) -> bool:
+    if log_rows:
+        return True
+    return bool(log_codes) and course_code in log_codes
+
+
+def _log_course_row(prefix: str, row_data: dict, full_text: bool) -> None:
+    print(f"{prefix} {row_data.get('course_code')} | {row_data.get('course_name')}")
+    print(f"  course_units: {_format_log_value(row_data.get('course_units'), full_text)}")
+    print(
+        f"  course_description: {_format_log_value(row_data.get('course_description'), full_text)}"
+    )
+    print(
+        f"  course_requirements: {_format_log_value(row_data.get('course_requirements'), full_text)}"
+    )
+    print(f"  learning_hours: {_format_log_value(row_data.get('learning_hours'), full_text)}")
+    print(
+        f"  course_equivalencies: {_format_log_value(row_data.get('course_equivalencies'), full_text)}"
+    )
+    print(
+        f"  offering_faculty: {_format_log_value(row_data.get('offering_faculty'), full_text)}"
+    )
+    outcomes = row_data.get("course_learning_outcomes") or []
+    print(f"  course_learning_outcomes_count: {len(outcomes)}")
+
+
+def _fix_sentence_spacing(text: str) -> str:
+    """
+    Insert a space after . ! ? when the next character is a letter and HTML/text
+    extraction glued sentences (e.g. 'hello.there' -> 'hello. there').
+    Skips typical decimals like 3.00 (digit before the period).
+    """
+    if not text:
+        return text
+    s = text
+    # Word/close-bracket + period + lowercase letter
+    s = re.sub(r"(?<=[a-zA-Z\)\]])\.(?=[a-z])", ". ", s)
+    # Lowercase + period + uppercase (e.g. 'experience.NOTE', 'Dr.Smith' -> 'Dr. Smith')
+    s = re.sub(r"(?<=[a-z])\.(?=[A-Z])", ". ", s)
+    s = re.sub(r"(?<=[a-zA-Z\)\]])\!(?=[A-Za-z])", "! ", s)
+    s = re.sub(r"(?<=[a-zA-Z\)\]])\?(?=[A-Za-z])", "? ", s)
+    return s
+
+
+def _normalize_whitespace(text: Optional[str]) -> Optional[str]:
+    if text is None:
+        return None
+    s = " ".join(text.split())
+    if not s:
+        return None
+    s = _fix_sentence_spacing(s)
+    return s
+
+
+def _strip_leading_label(text: Optional[str], *labels: str) -> Optional[str]:
+    """Remove the first matching leading label (e.g. 'Units: ', 'Requirements: ')."""
+    if not text:
+        return None
+    s = text.strip()
+    for label in labels:
+        if s.lower().startswith(label.lower()):
+            return _normalize_whitespace(s[len(label) :])
+    return _normalize_whitespace(s)
+
+
+def _courseblock_text_lines(course) -> list[str]:
+    """Non-empty lines from a .courseblock for fallback parsing."""
+    raw = course.get_text(separator="\n")
+    lines = []
+    for ln in raw.split("\n"):
+        s = " ".join(ln.split()).strip()
+        if s:
+            lines.append(s)
+    return lines
+
+
+def _fallback_units_from_lines(lines: list[str]) -> Optional[str]:
+    for line in lines:
+        if line.lower().startswith("units:"):
+            return _strip_leading_label(line, "Units:", "Units :")
+        m = re.search(r"\bUnits:\s*(\S+)", line, re.IGNORECASE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+
+def _fallback_line_after_prefix(lines: list[str], prefix: str) -> Optional[str]:
+    for line in lines:
+        if line.startswith(prefix):
+            return _normalize_whitespace(line[len(prefix) :].strip())
+    return None
+
+
+def _fallback_description_from_lines(lines: list[str], course_code: str) -> Optional[str]:
+    """First narrative block after the title line until a structured field line."""
+    struct_prefixes = (
+        "Learning Hours:",
+        "Requirements:",
+        "Offering Faculty:",
+        "Course Equivalencies:",
+        "Course Learning Outcomes:",
+    )
+    start = 0
+    if lines and course_code in lines[0]:
+        start = 1
+    parts: list[str] = []
+    for i in range(start, len(lines)):
+        line = lines[i]
+        if any(line.startswith(p) for p in struct_prefixes):
+            break
+        parts.append(line)
+    joined = " ".join(parts).strip()
+    return _normalize_whitespace(joined) if joined else None
 
 def create_supabase_client():
     """
@@ -43,25 +184,88 @@ def extract_courses_from_soup(soup):
     for course in courses:
         code_el = course.find("span", class_="detail-code")
         name_el = course.find("span", class_="detail-title")
-        units_el = course.find("span", class_="detail-hours_html")
-        if not code_el or not name_el or not units_el:
+        if not code_el or not name_el:
             continue
+
+        course_code = code_el.get_text(strip=True)
+        course_name = name_el.get_text(strip=True)
+        lines = _courseblock_text_lines(course)
+
+        units_el = course.find("span", class_="detail-hours_html")
+        if units_el:
+            course_units = _strip_leading_label(
+                units_el.get_text(strip=True), "Units:", "Units :"
+            )
+        else:
+            course_units = _fallback_units_from_lines(lines)
+
+        desc_el = course.find("div", class_="courseblockextra")
+        if desc_el:
+            course_description = _normalize_whitespace(
+                desc_el.get_text(separator=" ", strip=True)
+            )
+        else:
+            course_description = _fallback_description_from_lines(lines, course_code)
+
+        req_el = course.find("span", class_="detail-requirements")
+        if req_el:
+            course_requirements = _strip_leading_label(
+                req_el.get_text(separator=" ", strip=True),
+                "Requirements:",
+                "Requirements :",
+            )
+        else:
+            course_requirements = _fallback_line_after_prefix(lines, "Requirements:")
+
+        lh_el = course.find("span", class_="detail-learning_hours")
+        if lh_el:
+            learning_hours = _strip_leading_label(
+                lh_el.get_text(separator=" ", strip=True),
+                "Learning Hours:",
+                "Learning Hours :",
+            )
+        else:
+            learning_hours = _fallback_line_after_prefix(lines, "Learning Hours:")
+
+        eq_el = course.find("span", class_="detail-course_equivalencies")
+        if eq_el:
+            course_equivalencies = _strip_leading_label(
+                eq_el.get_text(separator=" ", strip=True),
+                "Course Equivalencies:",
+                "Course Equivalencies :",
+            )
+        else:
+            course_equivalencies = _fallback_line_after_prefix(
+                lines, "Course Equivalencies:"
+            )
+
+        fac_el = course.find("span", class_="detail-offering_faculty")
+        if fac_el:
+            offering_faculty = _strip_leading_label(
+                fac_el.get_text(separator=" ", strip=True),
+                "Offering Faculty:",
+                "Offering Faculty :",
+            )
+        else:
+            offering_faculty = _fallback_line_after_prefix(lines, "Offering Faculty:")
 
         learning_outcomes = []
         outcomes_section = course.find("span", class_="detail-cim_los")
         if outcomes_section:
             for li in outcomes_section.find_all("li"):
-                learning_outcomes.append(li.get_text(strip=True))
+                lo = _normalize_whitespace(li.get_text(separator=" ", strip=True))
+                if lo:
+                    learning_outcomes.append(lo)
 
         rows.append({
-            "course_code": code_el.get_text(strip=True),
-            "course_name": name_el.get_text(strip=True),
-            "course_units": units_el.get_text(strip=True).replace("Units: ", ""),
-            "course_description": course.find("div", class_="courseblockextra").get_text(strip=True) if course.find("div", class_="courseblockextra") else None,
-            "course_requirements": course.find("span", class_="detail-requirements").get_text(strip=True).replace("Requirements: ", "") if course.find("span", class_="detail-requirements") else None,
-            "learning_hours": course.find("span", class_="detail-learning_hours").get_text(strip=True).replace("Learning Hours: ", "") if course.find("span", class_="detail-learning_hours") else None,
-            "course_equivalencies": course.find("span", class_="detail-course_equivalencies").get_text(strip=True).replace("Course Equivalencies: ", "") if course.find("span", class_="detail-course_equivalencies") else None,
-            "offering_faculty": course.find("span", class_="detail-offering_faculty").get_text(strip=True).replace("Offering Faculty: ", "") if course.find("span", class_="detail-offering_faculty") else None,
+            "course_code": course_code,
+            "course_name": course_name,
+            "course_units": course_units,
+            "course_description": course_description,
+            "course_requirements": course_requirements,
+            "learning_hours": learning_hours,
+            "course_equivalencies": course_equivalencies,
+            "offering_faculty": offering_faculty,
             "course_learning_outcomes": learning_outcomes,
         })
     return rows
@@ -190,6 +394,42 @@ def scrape_all_course():
 
     print(f"Total number of courses scraped: {len(course_data)}")
 
+    # Always-on summary so CI logs show whether key fields are being captured.
+    summary_fields = [
+        "course_units",
+        "course_description",
+        "course_requirements",
+        "learning_hours",
+        "course_equivalencies",
+        "offering_faculty",
+    ]
+    print("Field coverage summary:")
+    for field in summary_fields:
+        non_null = int(course_data[field].notna().sum()) if field in course_data else 0
+        null_count = len(course_data) - non_null
+        print(f"  {field}: non_null={non_null} null={null_count}")
+    if "course_learning_outcomes" in course_data:
+        lo_counts = course_data["course_learning_outcomes"].apply(
+            lambda x: len(x) if isinstance(x, list) else 0
+        )
+        print(
+            "  course_learning_outcomes: "
+            f"rows_with_any={int((lo_counts > 0).sum())} "
+            f"max_per_course={int(lo_counts.max() if len(lo_counts) else 0)}"
+        )
+
+    log_rows = _env_flag("COURSE_SCRAPER_LOG_ROWS", False)
+    log_codes = _parse_log_codes()
+    full_text = _env_flag("COURSE_SCRAPER_LOG_FULL_TEXT", False)
+    if log_rows or log_codes:
+        print(
+            "Detailed scrape logging enabled "
+            f"(log_rows={log_rows}, codes={len(log_codes)}, full_text={full_text})"
+        )
+        for row_data in course_data.to_dict("records"):
+            if _should_log_course(row_data.get("course_code", ""), log_rows, log_codes):
+                _log_course_row("[SCRAPED]", row_data, full_text)
+
     return course_data
 
 def upsert_course_data_to_supabase(supabase, course_data, batch_size=50):
@@ -209,6 +449,13 @@ def upsert_course_data_to_supabase(supabase, course_data, batch_size=50):
     }
 
     upsert_payload = []
+    log_rows = _env_flag("COURSE_SCRAPER_LOG_ROWS", False)
+    log_codes = _parse_log_codes()
+    full_text = _env_flag("COURSE_SCRAPER_LOG_FULL_TEXT", False)
+    log_upsert = _env_flag("COURSE_SCRAPER_LOG_UPSERT", False)
+    total_rows = len(course_data)
+    total_batches = (total_rows + batch_size - 1) // batch_size if total_rows else 0
+    batch_number = 0
 
     for index, row in course_data.iterrows():
         course_code = row["course_code"]
@@ -236,8 +483,29 @@ def upsert_course_data_to_supabase(supabase, course_data, batch_size=50):
 
         # If batch size reached or last row, send to Supabase
         if len(upsert_payload) == batch_size or index == len(course_data) - 1:
-            supabase.table("courses").upsert(upsert_payload, on_conflict=["course_code"]).execute()
-            print(f"✅ Upserted {len(upsert_payload)} courses")
+            batch_number += 1
+            if log_upsert:
+                codes = [item["course_code"] for item in upsert_payload]
+                print(
+                    f"Upsert batch {batch_number}/{total_batches}: "
+                    f"{len(upsert_payload)} courses | codes={', '.join(codes)}"
+                )
+            if log_rows or log_codes:
+                for item in upsert_payload:
+                    if _should_log_course(item.get("course_code", ""), log_rows, log_codes):
+                        _log_course_row("[UPSERT]", item, full_text)
+            try:
+                supabase.table("courses").upsert(upsert_payload, on_conflict=["course_code"]).execute()
+            except Exception as exc:
+                failed_codes = ", ".join(item["course_code"] for item in upsert_payload)
+                print(
+                    f"❌ Upsert failed for batch {batch_number}/{total_batches} "
+                    f"(codes: {failed_codes})"
+                )
+                raise RuntimeError(
+                    f"Supabase upsert failed for codes: {failed_codes}"
+                ) from exc
+            print(f"✅ Upserted {len(upsert_payload)} courses (batch {batch_number}/{total_batches})")
             upsert_payload.clear()
 
     print("✔ Successfully batch upserted all course data into Supabase!")
