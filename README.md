@@ -1,23 +1,37 @@
-# CoursifyQU – Scrapers
+# 🕷️ Coursify — Scrapers
 
-A data collection layer for [Coursify](https://github.com/CoursifyQU), a course insights platform for Queen’s University students. This repository feeds:
+## 💡 What is Coursify?
 
-- **Course catalog data** from the official academic calendar (codes, descriptions, requirements, learning outcomes, and related metadata).
-- **RAG-ready text** from Reddit and RateMyProfessors, including structured tags and sentiment for student feedback used by the product’s retrieval stack.
+**Coursify** is a course-insights platform for Queen's University students. It features course grade distributions, relevant Reddit and RateMyProfessors comments, and also an AI Chatbot.
 
----
-
-## Related repositories
-
-| Repository | Purpose |
-|------------|---------|
-| [Coursify-Scrapers](https://github.com/CoursifyQU/Coursify-Scrapers) | Scrapers for Queen’s calendar, Reddit, and RateMyProfessors |
-| **Coursify-RAG** (under construction) | Embeddings and vector database for retrieval |
-| [Coursify-WebApp](https://github.com/CoursifyQU/Coursify-WebApp) | Next.js frontend |
+**This repository** is the **data collection layer**: scheduled and manual jobs that load the Queen's academic calendar, Reddit threads, and RateMyProfessors reviews into **Supabase** (`courses`, `professors`, `rag_chunks`) for the web app and RAG stack.
 
 ---
 
-## Layout
+## 🔗 Related repositories
+
+| Repository                                                           | Purpose                                                                                 |
+| -------------------------------------------------------------------- | --------------------------------------------------------------------------------------- |
+| [Coursify-WebApp](https://github.com/CoursifyQU/Coursify-WebApp)     | Full stack application                                                                  |
+| [Coursify-Scrapers](https://github.com/CoursifyQU/Coursify-Scrapers) | Scheduled data scrapers for the Queen's academic calendar, Reddit, and RateMyProfessors |
+| [Coursify-RAG](https://github.com/amaanjaved1/Coursify-RAG)          | Queen's Answers - Our chatbot                                                           |
+
+🌐 [**Live site**](https://www.coursify.ca/)
+
+---
+
+## 🛠️ Tech stack
+
+- **Supabase** (PostgREST client) — `courses`, `professors`, and `rag_chunks`
+- **Playwright** + **BeautifulSoup** — Queen's academic calendar
+- **PRAW** — Reddit
+- **ratemyprofessors-client** — RateMyProfessors
+- **transformers** / **torch** — on-device sentiment inference ([`CoursifyQU/student-review-sentiment`](https://huggingface.co/CoursifyQU/student-review-sentiment) for Reddit pipeline)
+- **GitHub Actions** — scheduled and manual scraper runs (`.github/workflows/scraper.yaml`)
+
+---
+
+## 📁 Layout
 
 ```
 apps/scrapers/
@@ -33,7 +47,7 @@ test_sentiment_comparison.py  # Optional local comparison of sentiment models
 
 ---
 
-## How it works
+## ⚙️ How it works
 
 ### GitHub Actions (`.github/workflows/scraper.yaml`)
 
@@ -52,20 +66,20 @@ The Supabase client code prefers `SUPABASE_SERVICE_ROLE_KEY` when set so server-
 
 **`course-scraper.py`**
 
-- Loads the [Queen’s Academic Calendar](https://www.queensu.ca/academic-calendar/) with **Playwright** (Chromium) and parses pages with **BeautifulSoup**.
+- Loads the [Queen's Academic Calendar](https://www.queensu.ca/academic-calendar/) with **Playwright** (Chromium) and parses pages with **BeautifulSoup**.
 - Upserts rows into `courses`, preserving manually maintained fields such as `average_gpa` and `average_enrollment` when updating existing codes.
 - Optional debugging env vars: `COURSE_SCRAPER_LOG_CODES` (comma-separated codes), `COURSE_SCRAPER_LOG_ROWS`, `COURSE_SCRAPER_LOG_FULL_TEXT`, `COURSE_SCRAPER_LOG_UPSERT` (truthy: `1`, `true`, `yes`, `on`).
 
 **`reddit-scraper.py`**
 
-- Uses **PRAW** against configured Queen’s-related subreddits.
+- Uses **PRAW** against configured Queen's-related subreddits.
 - Writes deduplicated chunks to `rag_chunks` with `source: reddit`, using `source_url` to avoid reprocessing.
 - Runs **Hugging Face** sentiment analysis on [`CoursifyQU/student-review-sentiment`](https://huggingface.co/CoursifyQU/student-review-sentiment), blended with a simple upvote-based signal for Reddit comments.
 - Derives **tags** (difficulty, workload, etc.) from comment text for downstream RAG filters.
 
 **`rmp-scraper.py`**
 
-- Uses the **`ratemyprofessors-client`** library (Queen’s institution id is configured in the script).
+- Uses the **`ratemyprofessors-client`** library (Queen's institution id is configured in the script).
 - Upserts professor metadata and review text into `professors` and `rag_chunks`, with deduplication informed by stored review timestamps.
 - Maps free-text course mentions to calendar codes using a strict normalization pass against `courses` from Supabase (unmatched mentions can roll up to `general_course` where appropriate).
 
@@ -73,7 +87,7 @@ Conventions for `general_course`, `general_professor`, and how Reddit vs RMP pop
 
 ---
 
-## Local setup
+## 🚀 Setup & development
 
 1. **Python:** 3.11 (matches CI).
 
@@ -101,8 +115,10 @@ Reddit requires `REDDIT_CLIENT_ID` and `REDDIT_CLIENT_SECRET`. Scrapers that use
 
 ---
 
-## Stack (scrapers)
+## 🤝 Contributing
 
-- **Supabase** (PostgREST client) for `courses`, `professors`, and `rag_chunks`
-- **Playwright** + BeautifulSoup (calendar), **PRAW** (Reddit), **ratemyprofessors-client** (RMP)
-- **transformers** / **torch** for on-device sentiment inference
+Contributions are welcome.
+
+- 🐛 **Issues** — Open an issue for scraper bugs, schema questions, or workflow changes before large refactors.
+- 🔀 **Pull requests** — Keep changes focused; match existing patterns in `apps/scrapers/`.
+- 🔐 **Security** — Do not commit Supabase keys or Reddit credentials; use `.env.example` as a template only.
