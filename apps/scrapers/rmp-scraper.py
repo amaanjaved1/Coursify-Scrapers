@@ -163,6 +163,7 @@ def scrape_professors(client, supabase, testing=True):
     print(f"  {with_ratings} with ratings, {without_ratings} with no ratings")
     return professors
 
+# Human-readable RMP labels -> canonical tags (same vocabulary as reddit-scraper detect_tags).
 RMP_TAG_TO_CANONICAL = {
     "Tough grader": ["hard", "grading"],
     "Clear grading criteria": ["grading"],
@@ -190,11 +191,41 @@ RMP_TAG_TO_CANONICAL = {
     "Would not take again": ["recommendation"],
 }
 
+
+def _normalize_rmp_tag_key(label: str) -> str:
+    """Single key for lookup: collapse whitespace, strip, case-insensitive."""
+    collapsed = re.sub(r"\s+", " ", str(label).strip())
+    return collapsed.casefold()
+
+
+def _build_rmp_tag_lookup(canonical_map: dict[str, list[str]]) -> dict[str, list[str]]:
+    """Case-insensitive keys for API variants like 'TOUGH GRADER' vs 'Tough grader'."""
+    by_key: dict[str, list[str]] = {}
+    for label, mapped in canonical_map.items():
+        key = _normalize_rmp_tag_key(label)
+        if key in by_key:
+            merged = set(by_key[key]) | set(mapped)
+            by_key[key] = sorted(merged)
+        else:
+            by_key[key] = list(mapped)
+    return by_key
+
+
+_RMP_TAG_TO_CANONICAL_BY_KEY = _build_rmp_tag_lookup(RMP_TAG_TO_CANONICAL)
+
+
 def normalize_rmp_tags(raw_tags):
-    """Map raw RMP tags to canonical tag set, returning deduplicated canonical tags."""
+    """Map raw RMP tags to canonical tag set, returning deduplicated sorted canonical tags."""
+    if not raw_tags:
+        return []
     canonical = set()
     for tag in raw_tags:
-        for mapped in RMP_TAG_TO_CANONICAL.get(tag, []):
+        if tag is None:
+            continue
+        key = _normalize_rmp_tag_key(tag)
+        if not key:
+            continue
+        for mapped in _RMP_TAG_TO_CANONICAL_BY_KEY.get(key, []):
             canonical.add(mapped)
     return sorted(canonical)
 
@@ -362,8 +393,8 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
         canonical_tags = normalize_rmp_tags(review_tags)
         sentiment_score, sentiment_label = detect_sentiment(comment)
 
-        # Track tag counts for professor-level tags
-        for tag in review_tags:
+        # Professor-level tag rollups use the same canonical vocabulary as rag_chunks
+        for tag in canonical_tags:
             all_tag_counts[tag] = all_tag_counts.get(tag, 0) + 1
 
         parsed_review = {
@@ -371,7 +402,6 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
             "quality": quality,
             "difficulty": difficulty,
             "comment": normalized_comment,
-            "tags": review_tags,
             "canonical_tags": canonical_tags,
             "sentiment_score": sentiment_score,
             "sentiment_label": sentiment_label,
@@ -424,7 +454,7 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
                     "course_code": code,
                     "professor_name": prof["name"],
                     "source_url": prof["url"],
-                    "tags": review["canonical_tags"] + review["tags"],
+                    "tags": list(review["canonical_tags"]),
                     "created_at": review["date"],
                     "quality_rating": review["quality"],
                     "sentiment_score": review["sentiment_score"],
