@@ -305,7 +305,7 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
             "overall_rating": overall_rating,
             "percent_retake": percent_take_again,
             "level_of_difficulty": level_of_difficulty,
-            "professor_tags": [],
+            "professor_tags": normalize_rmp_tags(prof_details.tags),
             "latest_comment_date": None,
             "num_ratings": prof["num_ratings"],
             "url": prof["url"],
@@ -357,9 +357,6 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
     seen_reviews_set = set()
     print(f"  Existing reviews in DB: {len(existing_reviews_set)}")
 
-    # Collect all unique tags from ratings for professor-level tags
-    all_tag_counts = {}
-
     reviews = []
     skipped_invalid = 0
     skipped_duplicate = 0
@@ -389,13 +386,8 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
             continue
         seen_reviews_set.add((normalized_comment, rating_date))
 
-        review_tags = rating.tags
-        canonical_tags = normalize_rmp_tags(review_tags)
+        canonical_tags = normalize_rmp_tags(rating.tags)
         sentiment_score, sentiment_label = detect_sentiment(comment)
-
-        # Professor-level tag rollups use the same canonical vocabulary as rag_chunks
-        for tag in canonical_tags:
-            all_tag_counts[tag] = all_tag_counts.get(tag, 0) + 1
 
         parsed_review = {
             "date": rating_date,
@@ -412,8 +404,8 @@ def scrape_professor_comments(client, supabase, prof, valid_courses):
 
     print(f"  Processing: {len(reviews)} new, {skipped_duplicate} duplicates, {skipped_invalid} invalid (too short)")
 
-    # Build top tags from aggregated tag counts
-    top_tags = sorted(all_tag_counts, key=all_tag_counts.get, reverse=True)[:5]
+    # Use professor-level tags from the API (v3: Professor.tags reflects all-time ratings)
+    top_tags = normalize_rmp_tags(prof_details.tags)[:5]
 
     latest_date = None
     if len(reviews) > 0:
