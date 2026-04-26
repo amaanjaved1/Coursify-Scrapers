@@ -388,6 +388,7 @@ def scrape_all_course():
 
     # Drop duplicates
     course_data.drop_duplicates(subset=["course_code"], inplace=True)
+    course_data.reset_index(drop=True, inplace=True)
 
     # Clean the dataframe
     course_data.replace({np.nan: None, float("inf"): None, float("-inf"): None}, inplace=True)

@@ -63,7 +63,6 @@ jobs:
 
   rmp-scraper:
     needs: course-scraper
-    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && startsWith(github.event.schedule, '0 0 1')) # Only run on 1st of month or manual
     runs-on: ubuntu-latest
 
     steps:

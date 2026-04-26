@@ -493,10 +493,16 @@ if __name__ == "__main__":
     reddit = setup_reddit()
 
     # Get all valid courses from Supabase
-    courses_response = supabase.table("courses").select("course_code").execute()
-    courses = courses_response.data
-    courses = [c for c in courses if c["course_code"] != "general_course"]
-    courses = {c["course_code"] for c in courses}
+    all_courses = []
+    page_size = 1000
+    offset = 0
+    while True:
+        batch = supabase.table("courses").select("course_code").range(offset, offset + page_size - 1).execute().data
+        all_courses.extend(batch)
+        if len(batch) < page_size:
+            break
+        offset += page_size
+    courses = {c["course_code"] for c in all_courses if c["course_code"] != "general_course"}
 
     # Get all valid professors from Supabase
     professors_response = supabase.table("professors").select("name").execute()
