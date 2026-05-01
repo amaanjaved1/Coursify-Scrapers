@@ -271,34 +271,159 @@ def extract_courses_from_soup(soup):
     return rows
 
 
+ACADEMIC_CALENDAR_ROOT = "https://www.queensu.ca/academic-calendar/"
+
+# Faculties whose courses are known to live on dedicated pages. The scraper
+# always hits these (so we never regress), then runs an auto-discovery pass
+# against the academic calendar root to surface any faculties not in this list.
+KNOWN_FACULTY_PAGES: list[dict] = [
+    {"faculty": "Arts & Science", "url": "https://www.queensu.ca/academic-calendar/arts-science/course-descriptions/", "mode": "arts-science"},
+    {"faculty": "Education", "url": "https://www.queensu.ca/academic-calendar/education/course-descriptions/", "mode": "single"},
+    {"faculty": "Health Sciences", "url": "https://www.queensu.ca/academic-calendar/health-sciences/bhsc/courses-instruction/", "mode": "single"},
+    {"faculty": "Nursing", "url": "https://www.queensu.ca/academic-calendar/nursing/bachelor-nursing-science-course-descriptions/", "mode": "single"},
+    {"faculty": "Engineering - APSC", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/apsc/", "mode": "single"},
+    {"faculty": "Engineering - CHEE", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/chee/", "mode": "single"},
+    {"faculty": "Engineering - CIVL", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/civl/", "mode": "single"},
+    {"faculty": "Engineering - CMPE", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/cmpe/", "mode": "single"},
+    {"faculty": "Engineering - ELEC", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/elec/", "mode": "single"},
+    {"faculty": "Engineering - ENCH", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/ench/", "mode": "single"},
+    {"faculty": "Engineering - ENPH", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/enph/", "mode": "single"},
+    {"faculty": "Engineering - GEOE", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/geoe/", "mode": "single"},
+    {"faculty": "Engineering - MTHE", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/mthe/", "mode": "single"},
+    {"faculty": "Engineering - MECH", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/mech/", "mode": "single"},
+    {"faculty": "Engineering - MREN", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/mren/", "mode": "single"},
+    {"faculty": "Engineering - MINE", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/mine/", "mode": "single"},
+    {"faculty": "Engineering - MNTC", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/mntc/", "mode": "single"},
+    {"faculty": "Engineering - SOFT", "url": "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/soft/", "mode": "single"},
+    {"faculty": "Commerce", "url": "https://www.queensu.ca/academic-calendar/business/bachelor-commerce/courses-of-instruction/by20number/#onezerozeroleveltext", "mode": "single"},
+    {"faculty": "Law", "url": "https://www.queensu.ca/academic-calendar/law/courses-instruction/", "mode": "single"},
+]
+
+# Slugs that are not faculties / not expected to expose course pages — skip
+# during auto-discovery to avoid wasted requests.
+DISCOVERY_SKIP_SLUGS = {
+    "", "search", "policies", "general-information", "academic-regulations",
+    "glossary", "about", "contact", "privacy", "accessibility", "calendar",
+    "student-services", "admissions", "fees-and-financial-assistance",
+    "important-dates-and-deadlines",
+}
+
+COURSE_PATH_HINTS = ("course-descriptions", "courses-instruction", "courses-of-instruction")
+
+
+def _abs_url(href: str) -> Optional[str]:
+    if not href:
+        return None
+    if href.startswith("http"):
+        return href
+    if href.startswith("/"):
+        return "https://www.queensu.ca" + href
+    return "https://www.queensu.ca/" + href
+
+
+def _faculty_slug_from_url(url: str) -> Optional[str]:
+    m = re.match(r"https?://www\.queensu\.ca/academic-calendar/([^/?#]+)/?", url or "")
+    return m.group(1) if m else None
+
+
+def discover_extra_faculty_pages(page, known_slugs: set[str]) -> list[dict]:
+    """
+    Crawl the academic-calendar root and surface any faculty slugs not present
+    in `known_slugs`, returning their course-listing pages when found.
+    Best-effort: failures here must not break the scrape; we just log and skip.
+    """
+    extras: list[dict] = []
+    try:
+        soup = fetch_page(page, ACADEMIC_CALENDAR_ROOT, wait_selector=None)
+    except Exception as exc:
+        print(f"  Auto-discovery: failed to load calendar root ({exc})")
+        return extras
+
+    candidate_slugs: set[str] = set()
+    for a in soup.select('a[href*="/academic-calendar/"]'):
+        href = a.get("href") or ""
+        full = _abs_url(href) or ""
+        slug = _faculty_slug_from_url(full)
+        if not slug or slug in DISCOVERY_SKIP_SLUGS or slug in known_slugs:
+            continue
+        candidate_slugs.add(slug)
+
+    for slug in sorted(candidate_slugs):
+        index_url = f"{ACADEMIC_CALENDAR_ROOT}{slug}/"
+        try:
+            faculty_soup = fetch_page(page, index_url, wait_selector=None)
+        except Exception as exc:
+            print(f"  Auto-discovery: skip {slug} ({exc})")
+            continue
+
+        # Look for any link on the faculty index whose path contains one of the
+        # known course-listing path hints.
+        seen_urls: set[str] = set()
+        for a in faculty_soup.select("a[href]"):
+            href = a.get("href") or ""
+            if not any(hint in href for hint in COURSE_PATH_HINTS):
+                continue
+            full = _abs_url(href)
+            if not full or f"/academic-calendar/{slug}/" not in full:
+                continue
+            full = full.split("#", 1)[0].rstrip("/") + "/"
+            if full in seen_urls:
+                continue
+            seen_urls.add(full)
+            extras.append({
+                "faculty": slug.replace("-", " ").title(),
+                "url": full,
+                "mode": "single",
+            })
+
+    if extras:
+        print(f"  Auto-discovery: found {len(extras)} additional course page(s)")
+        for entry in extras:
+            print(f"    + {entry['faculty']}: {entry['url']}")
+    else:
+        print("  Auto-discovery: no new faculty course pages found")
+    return extras
+
+
+def _scrape_arts_science(page, base_url: str) -> list[dict]:
+    """Arts & Science needs department-level link discovery before scraping."""
+    rows: list[dict] = []
+    soup = fetch_page(page, base_url, wait_selector='a[href*="arts-science/course-descriptions/"]')
+
+    container = soup.find("ul", {"id": "/arts-science/course-descriptions/"})
+    if container is not None:
+        dept_links = container.find_all("a")
+    else:
+        def _is_dept_href(h):
+            if not h or "arts-science/course-descriptions/" not in h or "crse-mode" in h:
+                return False
+            parts = h.replace("https://www.queensu.ca", "").strip("/").split("/")
+            try:
+                i = parts.index("course-descriptions")
+                return len(parts) > i + 1 and (len(parts) == i + 2 or (len(parts) == i + 3 and parts[-1] == ""))
+            except ValueError:
+                return False
+        dept_links = [a for a in soup.select('a[href*="arts-science/course-descriptions/"]') if _is_dept_href(a.get("href"))]
+
+    for dept_link in dept_links:
+        dept_url = _abs_url(dept_link.get("href"))
+        dept_name = dept_link.get_text(strip=True)
+        if not dept_url:
+            continue
+        dept_soup = fetch_page(page, dept_url)
+        dept_rows = extract_courses_from_soup(dept_soup)
+        rows.extend(dept_rows)
+        print(f"  {dept_name}: {len(dept_rows)} courses")
+    return rows
+
+
 def scrape_all_course():
     """
     Scrape course data from Queen's University website and store it in Supabase.
-    Uses Playwright to render JS-heavy pages.
+    Iterates the known faculty pages, then runs auto-discovery to catch any
+    faculties not in the hardcoded list.
     """
-    art_sci_url = "https://www.queensu.ca/academic-calendar/arts-science/course-descriptions/"
-    education_url = "https://www.queensu.ca/academic-calendar/education/course-descriptions/"
-    health_sci_url = "https://www.queensu.ca/academic-calendar/health-sciences/bhsc/courses-instruction/"
-    nursing_url = "https://www.queensu.ca/academic-calendar/nursing/bachelor-nursing-science-course-descriptions/"
-    engineering_urls = [
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/apsc/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/chee/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/civl/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/cmpe/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/elec/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/ench/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/enph/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/geoe/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/mthe/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/mech/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/mren/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/mine/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/mntc/",
-        "https://www.queensu.ca/academic-calendar/engineering-applied-sciences/courses-instruction/soft/",
-    ]
-    commerce_url = "https://www.queensu.ca/academic-calendar/business/bachelor-commerce/courses-of-instruction/by20number/#onezerozeroleveltext"
-
-    all_rows = []
+    all_rows: list[dict] = []
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
@@ -307,80 +432,29 @@ def scrape_all_course():
         )
         page = context.new_page()
 
-        # Faculty 1: Arts & Science
-        print("Scraping Arts & Science courses...")
-        soup = fetch_page(page, art_sci_url, wait_selector='a[href*="arts-science/course-descriptions/"]')
+        known_slugs = {
+            slug for slug in (_faculty_slug_from_url(entry["url"]) for entry in KNOWN_FACULTY_PAGES)
+            if slug
+        }
+        extras = discover_extra_faculty_pages(page, known_slugs)
+        targets = list(KNOWN_FACULTY_PAGES) + extras
 
-        # Find department links
-        container = soup.find("ul", {"id": "/arts-science/course-descriptions/"})
-        if container is not None:
-            dept_links = container.find_all("a")
-        else:
-            def _is_dept_href(h):
-                if not h or "arts-science/course-descriptions/" not in h or "crse-mode" in h:
-                    return False
-                parts = h.replace("https://www.queensu.ca", "").strip("/").split("/")
-                try:
-                    i = parts.index("course-descriptions")
-                    return len(parts) > i + 1 and (len(parts) == i + 2 or (len(parts) == i + 3 and parts[-1] == ""))
-                except ValueError:
-                    return False
-            dept_links = [a for a in soup.select('a[href*="arts-science/course-descriptions/"]') if _is_dept_href(a.get("href"))]
-
-        for dept_link in dept_links:
-            dept_url = dept_link.get("href")
-            dept_name = dept_link.get_text(strip=True)
-            if not dept_url:
+        for entry in targets:
+            faculty = entry["faculty"]
+            url = entry["url"]
+            mode = entry.get("mode", "single")
+            print(f"Scraping {faculty} courses... ({url})")
+            try:
+                if mode == "arts-science":
+                    rows = _scrape_arts_science(page, url)
+                else:
+                    soup = fetch_page(page, url)
+                    rows = extract_courses_from_soup(soup)
+            except Exception as exc:
+                print(f"  ⚠️  Failed to scrape {faculty}: {exc}")
                 continue
-            if not dept_url.startswith("http"):
-                dept_url = "https://www.queensu.ca" + (dept_url if dept_url.startswith("/") else "/" + dept_url)
-
-            dept_soup = fetch_page(page, dept_url)
-            rows = extract_courses_from_soup(dept_soup)
             all_rows.extend(rows)
-            print(f"  {dept_name}: {len(rows)} courses")
-
-        print(f"✔ Arts & Science: {len(all_rows)} courses total")
-
-        # Faculty 2: Education
-        print("Scraping Education courses...")
-        soup = fetch_page(page, education_url)
-        rows = extract_courses_from_soup(soup)
-        all_rows.extend(rows)
-        print(f"✔ Education: {len(rows)} courses")
-
-        # Faculty 3: Health Sciences
-        print("Scraping Health Sciences courses...")
-        soup = fetch_page(page, health_sci_url)
-        rows = extract_courses_from_soup(soup)
-        all_rows.extend(rows)
-        print(f"✔ Health Sciences: {len(rows)} courses")
-
-        # Faculty 4: Nursing
-        print("Scraping Nursing courses...")
-        soup = fetch_page(page, nursing_url)
-        rows = extract_courses_from_soup(soup)
-        all_rows.extend(rows)
-        print(f"✔ Nursing: {len(rows)} courses")
-
-        # Faculty 5: Engineering
-        print("Scraping Engineering courses...")
-        eng_total = 0
-        for engineering_url in engineering_urls:
-            soup = fetch_page(page, engineering_url)
-            rows = extract_courses_from_soup(soup)
-            all_rows.extend(rows)
-            dept = engineering_url.rstrip("/").split("/")[-1].upper()
-            print(f"  {dept}: {len(rows)} courses")
-            eng_total += len(rows)
-        print(f"✔ Engineering: {eng_total} courses total")
-
-        # Faculty 6: Commerce
-        print("Scraping Commerce courses...")
-        soup = fetch_page(page, commerce_url)
-        rows = extract_courses_from_soup(soup)
-        all_rows.extend(rows)
-        print(f"✔ Commerce: {len(rows)} courses")
+            print(f"✔ {faculty}: {len(rows)} courses")
 
         browser.close()
 
